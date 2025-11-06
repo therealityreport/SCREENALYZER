@@ -384,6 +384,25 @@ def main():
     from app.workspace.common import read_pipeline_state
     pipeline_state = read_pipeline_state(selected_episode, DATA_ROOT)
 
+    # Handle cancelled state (show toast once)
+    if pipeline_state and pipeline_state.get("status") == "cancelled":
+        cancelled_key = f"_pipeline_cancelled_{selected_episode}"
+        if cancelled_key not in st.session_state:
+            st.info("✅ Pipeline was cancelled")
+            st.session_state[cancelled_key] = True
+
+            # Archive the cancelled state to prevent re-showing
+            state_file = DATA_ROOT / "harvest" / selected_episode / "diagnostics" / "pipeline_state.json"
+            if state_file.exists():
+                try:
+                    with open(state_file, "r") as f:
+                        final_state = json.load(f)
+                    final_state["status"] = "archived"
+                    with open(state_file, "w") as f:
+                        json.dump(final_state, f, indent=2)
+                except Exception:
+                    pass
+
     # Handle done state (show toast once)
     if pipeline_state and pipeline_state.get("status") == "done":
         done_key = f"_pipeline_done_{selected_episode}"
@@ -427,7 +446,7 @@ def main():
                     with open(state_file, "w") as f:
                         json.dump(final_state, f, indent=2)
 
-    if pipeline_state and pipeline_state.get("status") not in (None, "done", "archived"):
+    if pipeline_state and pipeline_state.get("status") not in (None, "done", "archived", "cancelled"):
         st.markdown("---")
 
         current_step = pipeline_state.get("current_step", "Unknown")
