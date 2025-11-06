@@ -275,9 +275,41 @@ def render_upload_page():
                                 f"✅ Upload complete!\n\n"
                                 f"**Episode:** `{selected_show_name.upper()} S{selected_season_number:02d} E{episode_number:02d}`\n\n"
                                 f"**File:** `{episode_id}.mp4`\n\n"
-                                f"**Location:** `data/videos/{canonical_show_slug(selected_show_name)}/s{selected_season_number:02d}/`\n\n"
-                                f"Session ID: `{session.session_id}`"
+                                f"**Location:** `data/videos/{canonical_show_slug(selected_show_name)}/s{selected_season_number:02d}/`"
                             )
+
+                            # Phase 3 P1: Auto-extract frames after upload
+                            st.info("🔄 Automatically extracting frames...")
+
+                            from jobs.tasks.auto_extract import trigger_auto_extraction
+                            from pathlib import Path
+
+                            video_path = Path("data/videos") / canonical_show_slug(selected_show_name) / f"s{selected_season_number:02d}" / f"{episode_id}.mp4"
+
+                            with st.spinner("Extracting frames... This may take a few minutes."):
+                                try:
+                                    extract_result = trigger_auto_extraction(
+                                        episode_id=episode_id,
+                                        video_path=video_path,
+                                    )
+
+                                    if extract_result.get("success"):
+                                        st.success(
+                                            f"✅ Frame extraction complete!\n\n"
+                                            f"**Episode Key:** `{extract_result['episode_key']}`\n\n"
+                                            f"You can now proceed to Workspace to prepare tracks."
+                                        )
+
+                                        # Store episode_id in session for redirect
+                                        st.session_state["last_uploaded_episode"] = episode_id
+                                    else:
+                                        st.warning(
+                                            f"⚠️ Frame extraction failed: {extract_result.get('error')}\n\n"
+                                            f"You can retry from the Workspace page."
+                                        )
+
+                                except Exception as e:
+                                    st.error(f"❌ Frame extraction error: {str(e)}")
 
                             # Clear validation state after successful upload
                             st.session_state[validation_key] = False

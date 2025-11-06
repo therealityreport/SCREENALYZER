@@ -719,6 +719,39 @@ def purge_all_episodes(
         stats["errors"].append(error_msg)
         logger.error(error_msg)
 
+    # CRITICAL: Also clear episodes from configs/shows_seasons.json (the registry)
+    # This is what the Workspace dropdown uses - if we don't clear this, episodes still show!
+    try:
+        from app.lib.registry import load_registry, save_registry
+
+        reg = load_registry()
+
+        # Clear episodes from all shows/seasons
+        for show in reg.get("shows", []):
+            for season in show.get("seasons", []):
+                season["episodes"] = []
+
+        save_registry(reg)
+        logger.info("Cleared episodes from configs/shows_seasons.json registry")
+    except Exception as e:
+        error_msg = f"Failed to clear shows_seasons.json registry: {str(e)}"
+        stats["errors"].append(error_msg)
+        logger.error(error_msg)
+
+    # Also clear Phase 2 episode registry files (episodes/*/state.json)
+    try:
+        episodes_registry_dir = DATA_ROOT / "episodes"
+        if episodes_registry_dir.exists():
+            import shutil
+            # Move to archive instead of deleting
+            archive_episodes_dir = archive_root / f"episodes_registry_{timestamp}"
+            shutil.move(str(episodes_registry_dir), str(archive_episodes_dir))
+            logger.info(f"Archived episode registry: {episodes_registry_dir} -> {archive_episodes_dir}")
+    except Exception as e:
+        error_msg = f"Failed to archive episodes registry: {str(e)}"
+        stats["errors"].append(error_msg)
+        logger.error(error_msg)
+
     # Emit summary audit event
     emit_episode_op_event(
         op_type="purge_all",

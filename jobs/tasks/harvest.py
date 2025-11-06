@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +26,14 @@ logger = logging.getLogger(__name__)
 
 # Checkpoint interval (30 seconds)
 CHECKPOINT_INTERVAL_SEC = 30
+
+# Frame asset contract (UI + asset server)
+FRAME_ASSET_SUBDIR = Path("frames/full")
+FRAME_INDEX_FILENAME = "frames_index.json"
+FRAME_EXT = ".jpg"
+FRAME_PAD = 6
+FRAME_JPEG_QUALITY = 92
+FRAME_IMWRITE_PARAMS = [int(cv2.IMWRITE_JPEG_QUALITY), FRAME_JPEG_QUALITY]
 
 
 def harvest_task(
@@ -81,6 +91,11 @@ def harvest_task(
         manifest_data = []
         frame_idx = 0
         sampled_count = 0
+        frames_dir = harvest_dir / FRAME_ASSET_SUBDIR
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        _ensure_dir_mode(frames_dir.parent)
+        _ensure_dir_mode(frames_dir)
+        frame_index_entries: list[dict] = []
 
         while True:
             ret = cap.grab()
@@ -103,6 +118,20 @@ def harvest_task(
                         "frame_id": frame_idx,
                         "ts_ms": ts_ms,
                         "sampled": True,
+                    }
+                )
+
+                rel_path = _ensure_frame_asset(
+                    frame,
+                    frames_dir,
+                    harvest_dir,
+                    frame_idx,
+                )
+                frame_index_entries.append(
+                    {
+                        "frame_id": int(frame_idx),
+                        "ts_ms": ts_ms,
+                        "path": rel_path,
                     }
                 )
 
@@ -144,6 +173,20 @@ def harvest_task(
         manifest_df = pd.DataFrame(manifest_data)
         manifest_path = harvest_dir / "manifest.parquet"
         manifest_df.to_parquet(manifest_path, index=False)
+
+        frame_index_path = harvest_dir / "frames" / FRAME_INDEX_FILENAME
+        frame_index_payload = {
+            "episode_id": episode_id,
+            "asset_base": FRAME_ASSET_SUBDIR.as_posix(),
+            "frame_ext": FRAME_EXT,
+            "frame_pad": FRAME_PAD,
+            "fps": round(float(fps), 6) if fps else None,
+            "frame_count": frame_count,
+            "sample_count": sampled_count,
+            "generated_at": datetime.utcnow().isoformat(),
+            "paths": frame_index_entries,
+        }
+        _write_json_atomic(frame_index_path, frame_index_payload)
 
         # Calculate coverage
         coverage_pct = (sampled_count / frame_count * 100) if frame_count > 0 else 0
@@ -195,6 +238,7 @@ def harvest_task(
             "episode_id": episode_id,
             "frames_sampled": sampled_count,
             "manifest_path": str(manifest_path),
+            "frames_index_path": str(frame_index_path),
         }
 
     finally:
@@ -214,3 +258,74 @@ def _update_job_progress(job_id: str, stage: str, progress_pct: float) -> None:
     from api.jobs import job_manager
 
     job_manager.update_job_progress(job_id, stage, progress_pct, message=f"Processing {stage}")
+
+
+def _ensure_dir_mode(path: Path, mode: int = 0o755) -> None:
+    """Best-effort chmod to ensure assets are world-readable."""
+    try:
+        os.chmod(path, mode)
+    except PermissionError:
+        logger.debug("chmod permission denied for %s", path)
+    except OSError:
+        logger.debug("chmod os error for %s", path)
+
+
+def _ensure_frame_asset(
+    frame,
+    frames_dir: Path,
+    harvest_dir: Path,
+    frame_id: int,
+) -> str:
+    """
+    Persist decoded frame as JPEG if needed and return relative path.
+
+    Returns:
+        Relative POSIX path to the saved frame asset.
+    """
+    # Lazy import to avoid hard dependency at module import time
+    import numpy as np
+
+    if not isinstance(frame, np.ndarray):
+        raise TypeError("frame must be a numpy ndarray")
+
+    filename = f"{frame_id:0{FRAME_PAD}d}{FRAME_EXT}"
+    target_path = frames_dir / filename
+
+    if target_path.exists() and target_path.stat().st_size > 0:
+        return target_path.relative_to(harvest_dir).as_posix()
+
+    success, encoded = cv2.imencode(FRAME_EXT, frame, FRAME_IMWRITE_PARAMS)
+    if not success:
+        raise RuntimeError(f"Failed to encode frame {frame_id} to JPEG")
+
+    tmp_fd, tmp_name = tempfile.mkstemp(dir=str(frames_dir), suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "wb") as fh:
+            fh.write(encoded.tobytes())
+        os.replace(tmp_name, target_path)
+        os.chmod(target_path, 0o644)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+    return target_path.relative_to(harvest_dir).as_posix()
+
+
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    """Write JSON payload atomically with 0644 permissions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+        os.replace(tmp_name, path)
+        os.chmod(path, 0o644)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+        raise

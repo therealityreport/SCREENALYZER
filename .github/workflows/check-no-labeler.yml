@@ -1,0 +1,44 @@
+name: Check No Legacy Labeler Files
+
+on:
+  pull_request:
+    branches: [ main, master ]
+  push:
+    branches: [ main, master ]
+
+jobs:
+  check-legacy-files:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Check for legacy labeler files
+        run: |
+          echo "Checking for legacy labeler files..."
+
+          # Check for labeler.py in app/ (excluding deprecated/)
+          if find app -name "*labeler*" -type f | grep -v deprecated | grep -q .; then
+            echo "❌ Found legacy labeler files in app/"
+            find app -name "*labeler*" -type f | grep -v deprecated
+            exit 1
+          fi
+
+          # Check for legacy page files
+          if find app/pages -name "labeler*" -type f 2>/dev/null | grep -q .; then
+            echo "❌ Found legacy labeler files in app/pages/"
+            find app/pages -name "labeler*" -type f
+            exit 1
+          fi
+
+          # Check for legacy module files (should be in deprecated/)
+          LEGACY_MODULES=("all_faces_redesign.py" "pairwise_review_redesign.py" "cluster_split.py" "review_pages.py")
+          for module in "${LEGACY_MODULES[@]}"; do
+            if [ -f "app/$module" ]; then
+              echo "❌ Found legacy module in app/: $module"
+              echo "   This should be in deprecated/ directory"
+              exit 1
+            fi
+          done
+
+          echo "✅ No legacy labeler files found"
+          echo "✅ Entry point should be: streamlit run app/Home.py"

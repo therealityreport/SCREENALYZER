@@ -154,16 +154,27 @@ def orchestrate_prepare(
     artifacts = check_artifacts(episode_id, data_root)
     logger.info(f"[{job_id}] Current artifacts: {artifacts}")
 
-    # Auto-harvest if manifest doesn't exist
-    if not artifacts["manifest"]:
-        logger.info(f"[{job_id}] Manifest not found, running harvest first...")
+    # CRITICAL: Always load video_path from episode registry FIRST
+    from api.jobs import job_manager
 
-        # Find video path from registry
+    # Try to get episode_key and load registry
+    episode_key = job_manager.normalize_episode_key(episode_id)
+    registry_data = job_manager.load_episode_registry(episode_key)
+
+    video_path = None
+
+    # Source 1: Episode registry (Phase 2+)
+    if registry_data:
+        video_path = registry_data.get("video_path")
+        logger.info(f"[{job_id}] Loaded video_path from episode registry: {video_path}")
+
+    # Source 2: Old registry (fallback for legacy episodes)
+    if not video_path:
+        logger.warning(f"[{job_id}] No episode registry found, trying legacy registry")
         from screentime.models import get_registry
-        registry = get_registry()
+        old_registry = get_registry()
 
-        video_path = None
-        for show in getattr(registry, "shows", []):
+        for show in getattr(old_registry, "shows", []):
             for season in getattr(show, "seasons", []):
                 for ep in getattr(season, "episodes", []):
                     if ep.episode_id == episode_id:
@@ -174,8 +185,27 @@ def orchestrate_prepare(
             if video_path:
                 break
 
-        if not video_path or not Path(video_path).exists():
-            raise ValueError(f"Video file not found for episode {episode_id}")
+    # Source 3: diagnostics/episodes.json (last resort)
+    if not video_path:
+        logger.warning(f"[{job_id}] No video_path in registries, trying episodes.json")
+        from app.lib.registry import load_episodes_json
+        episodes_data = load_episodes_json()
+        for ep in episodes_data.get("episodes", []):
+            if ep.get("episode_id") == episode_id:
+                video_path = ep.get("video_path")
+                break
+
+    if not video_path:
+        raise ValueError(f"ERR_EPISODE_NOT_REGISTERED: Cannot find video_path for {episode_id} (episode_key: {episode_key})")
+
+    if not Path(video_path).exists():
+        raise ValueError(f"Video file not found: {video_path}")
+
+    logger.info(f"[{job_id}] Using video_path: {video_path}")
+
+    # Auto-harvest if manifest doesn't exist
+    if not artifacts["manifest"]:
+        logger.info(f"[{job_id}] Manifest not found, running harvest first...")
 
         logger.info(f"[{job_id}] Running harvest from {video_path}")
 
@@ -202,6 +232,32 @@ def orchestrate_prepare(
         "final_state": artifacts.copy(),
     }
 
+    # Create episode registry and job envelope before dispatching stages
+    from api.jobs import job_manager
+
+    # Ensure episode registry exists and get canonical key
+    episode_key = job_manager.ensure_episode_registry(episode_id, video_path)
+    logger.info(f"[{job_id}] Episode registry ensured for {episode_key}")
+
+    # Create job envelope with registry reference
+    registry_path = f"episodes/{episode_key}/state.json"
+    envelope = {
+        "job_id": job_id,
+        "episode_id": episode_id,
+        "episode_key": episode_key,
+        "video_path": video_path,
+        "mode": "prepare",
+        "created_at": time.time(),
+        "registry_path": registry_path,
+        "stages": {
+            "detect": {"status": "pending"},
+            "track": {"status": "pending"},
+            "stills": {"status": "pending"},
+        },
+    }
+    job_manager.write_job_envelope(job_id, envelope)
+    logger.info(f"[{job_id}] Wrote job envelope to disk (registry: {registry_path})")
+
     total_steps = len(PREPARE_STAGES)
 
     # Execute each Prepare stage
@@ -210,6 +266,9 @@ def orchestrate_prepare(
         if not needs_step(step_key, artifacts, force):
             logger.info(f"[{job_id}] {step_name} artifacts exist, skipping")
             results["stages"][step_key] = {"status": "skipped"}
+
+            # Update job envelope stage status
+            job_manager.update_stage_status(job_id, step_key, "skipped")
 
             # Emit skipped progress
             emit_progress(
@@ -278,6 +337,14 @@ def orchestrate_prepare(
             results["stages"][step_key] = {"status": "ok", "result": json_safe(result)}
             artifacts = check_artifacts(episode_id, data_root)
 
+            # Update job envelope stage status
+            job_manager.update_stage_status(job_id, step_key, "ok", result=json_safe(result))
+
+            # Update episode registry state
+            state_mapping = {"detect": "detected", "track": "tracked", "stills": "stills_generated"}
+            if step_key in state_mapping:
+                job_manager.update_registry_state(episode_key, state_mapping[step_key], True)
+
             # Emit success progress
             emit_progress(
                 episode_id=episode_id,
@@ -301,6 +368,9 @@ def orchestrate_prepare(
         except Exception as exc:
             logger.error(f"[{job_id}] {step_name} failed: {exc}", exc_info=True)
             results["stages"][step_key] = {"status": "error", "error": str(exc)}
+
+            # Update job envelope stage status
+            job_manager.update_stage_status(job_id, step_key, "error", error=str(exc))
 
             # Emit error progress
             emit_progress(

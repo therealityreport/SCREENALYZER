@@ -91,7 +91,13 @@ def save_registry(reg: dict):
     tmp = REG.with_suffix(".tmp")
     tmp.write_text(json.dumps(reg, indent=2))
     tmp.replace(REG)
-    st.session_state["registry_dirty"] = True
+    
+    # Mark as dirty in session state (if streamlit is available)
+    try:
+        st.session_state["registry_dirty"] = True
+    except (RuntimeError, AttributeError):
+        # Streamlit not available or session state not initialized - that's okay
+        pass
 
 
 def get_all_episodes(reg: dict) -> list[tuple[str, str, str]]:

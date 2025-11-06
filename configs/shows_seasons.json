@@ -55,28 +55,8 @@
           ],
           "episodes": [
             {
-              "episode_id": "RHOBH_S05_E15_11052025",
-              "video_path": "data/videos/rhobh/s05/RHOBH_S05_E15_11052025.mp4",
-              "status": "processing"
-            },
-            {
-              "episode_id": "RHOBH_S05_E14_11052025",
-              "video_path": "data/videos/rhobh/s05/RHOBH_S05_E14_11052025.mp4",
-              "status": "processing"
-            },
-            {
-              "episode_id": "RHOBH_S05_E18_11052025",
-              "video_path": "data/videos/rhobh/s05/RHOBH_S05_E18_11052025.mp4",
-              "status": "processing"
-            },
-            {
-              "episode_id": "RHOBH_S05_E01_11052025",
-              "video_path": "data/videos/rhobh/s05/RHOBH_S05_E01_11052025.mp4",
-              "status": "processing"
-            },
-            {
-              "episode_id": "RHOBH_S05_E02_11052025",
-              "video_path": "data/videos/rhobh/s05/RHOBH_S05_E02_11052025.mp4",
+              "episode_id": "RHOBH_S05_E01_11062025",
+              "video_path": "data/videos/rhobh/s05/RHOBH_S05_E01_11062025.mp4",
               "status": "processing"
             }
           ],

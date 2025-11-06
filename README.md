@@ -74,7 +74,7 @@ Screenalyzer automates cast screen-time tracking by combining face detection, tr
 
 6. Launch Streamlit UI (when implemented in Phase 1):
    ```bash
-   streamlit run app/labeler.py
+   streamlit run app/Home.py
    ```
 
 ## Project Structure

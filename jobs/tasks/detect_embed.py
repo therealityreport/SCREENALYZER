@@ -39,7 +39,28 @@ def detect_embed_task(job_id: str, episode_id: str) -> dict:
     Returns:
         Dict with detection results
     """
-    logger.info(f"[{job_id}] Starting detect_embed task for {episode_id}")
+    from api.jobs import job_manager
+
+    # Get canonical episode key for logging and registry updates
+    episode_key = job_manager.normalize_episode_key(episode_id)
+
+    logger.info(f"[DETECT] {episode_key} stage=start job_id={job_id}")
+
+    # CRITICAL: Update envelope and registry at START to show progress in UI
+    # Mark stage as running in envelope (for UI polling)
+    if job_id != "manual":
+        try:
+            job_manager.update_stage_status(job_id, "detect", "running")
+            logger.info(f"[DETECT] {episode_key} envelope stage=running")
+        except Exception as e:
+            logger.warning(f"[DETECT] {episode_key} Could not update envelope: {e}")
+
+    # Mark detected=false in registry (will flip to true on success)
+    try:
+        job_manager.update_registry_state(episode_key, "detected", False)
+        logger.info(f"[DETECT] {episode_key} registry detected=false")
+    except Exception as e:
+        logger.warning(f"[DETECT] {episode_key} Could not update registry: {e}")
 
     # Load config
     config_path = Path("configs/pipeline.yaml")
@@ -66,12 +87,97 @@ def detect_embed_task(job_id: str, episode_id: str) -> dict:
             raise ValueError(f"Episode {episode_id} not found in registry")
         video_path = str(Path("data") / episode_data["video_path"])
     else:
-        # Job workflow: get video path from job metadata
+        # Job workflow: get video path from job metadata (with self-healing)
         from api.jobs import job_manager
+
+        # Try Redis first
         job_data = job_manager._get_job_metadata(job_id)
+
         if not job_data:
-            raise ValueError(f"Job metadata not found for {job_id}")
-        video_path = job_data["video_path"]
+            # Self-heal: try loading job envelope from disk
+            logger.warning(f"[{job_id}] Job metadata not in Redis, attempting self-heal from disk envelope")
+            envelope = job_manager.load_job_envelope(job_id)
+
+            if envelope:
+                logger.info(f"[{job_id}] Recovered from disk envelope")
+                video_path = envelope.get("video_path")
+                if not video_path:
+                    raise ValueError(f"Job envelope missing video_path for {job_id}")
+            else:
+                # Try episode registry
+                logger.warning(f"[{job_id}] No disk envelope, attempting self-heal from episode registry")
+
+                # Extract episode_id from job_id (e.g., prepare_RHOBH_S05_E03_11062025 -> RHOBH_S05_E03_11062025)
+                episode_id_from_job = None
+                if job_id.startswith("prepare_"):
+                    episode_id_from_job = job_id.replace("prepare_", "")
+                elif job_id.startswith("cluster_"):
+                    episode_id_from_job = job_id.replace("cluster_", "")
+                elif job_id.startswith("analytics_"):
+                    episode_id_from_job = job_id.replace("analytics_", "")
+
+                if episode_id_from_job:
+                    episode_key = job_manager.normalize_episode_key(episode_id_from_job)
+                    registry = job_manager.load_episode_registry(episode_key)
+
+                    if registry:
+                        video_path = registry.get("video_path")
+                        logger.info(f"[{job_id}] Recovered video path from episode registry: {video_path}")
+
+                        # Reconstruct envelope from registry
+                        reconstructed_envelope = {
+                            "job_id": job_id,
+                            "episode_id": episode_id_from_job,
+                            "episode_key": episode_key,
+                            "video_path": video_path,
+                            "mode": "prepare",
+                            "created_at": time.time(),
+                            "self_healed": True,
+                            "registry_path": f"episodes/{episode_key}/state.json",
+                            "stages": {
+                                "detect": {"status": "running"},
+                            },
+                        }
+                        job_manager.write_job_envelope(job_id, reconstructed_envelope)
+                        logger.info(f"[{job_id}] Wrote reconstructed envelope from registry")
+                    else:
+                        # Last resort: try to reconstruct from episodes.json
+                        logger.warning(f"[{job_id}] No episode registry, attempting self-heal from episodes.json")
+                        from app.lib.registry import load_episodes_json
+                        episodes_data = load_episodes_json()
+
+                        # Find episode by matching job_id pattern (e.g., prepare_RHOBH_S05_E03_11062025)
+                episode_match = None
+                for ep in episodes_data.get("episodes", []):
+                    ep_id = ep.get("episode_id", "")
+                    if ep_id and ep_id in job_id:
+                        episode_match = ep
+                        break
+
+                if episode_match:
+                    video_path = episode_match.get("video_path")
+                    logger.info(f"[{job_id}] Recovered video path from episodes.json: {video_path}")
+
+                    # Reconstruct minimal envelope for future use
+                    reconstructed_envelope = {
+                        "job_id": job_id,
+                        "episode_key": episode_match.get("episode_id"),
+                        "video_path": video_path,
+                        "mode": "prepare",
+                        "created_at": time.time(),
+                        "self_healed": True,
+                        "stages": {
+                            "detect": {"status": "running"},
+                        },
+                    }
+                    job_manager.write_job_envelope(job_id, reconstructed_envelope)
+                    logger.info(f"[{job_id}] Wrote reconstructed envelope")
+        else:
+            video_path = job_data["video_path"]
+
+    # Final safety check - video_path MUST be set by now
+    if not video_path:
+        raise ValueError(f"ERR_EPISODE_NOT_REGISTERED: video_path could not be resolved for job {job_id}, episode {episode_id}")
 
     # Initialize detector and embedder
     min_face_px = config["video"]["min_face_px"]
@@ -81,11 +187,21 @@ def detect_embed_task(job_id: str, episode_id: str) -> dict:
     # Get embedding config
     embedding_cfg = config["embedding"]
 
+    # Load models with timing
+    model_start = time.time()
+    logger.info(f"[DETECT] {episode_key} model=retinaface loading...")
+
     detector = RetinaFaceDetector(
         min_face_px=min_face_px,
         min_confidence=min_confidence,
         provider_order=provider_order,
     )
+
+    detector_time = time.time() - model_start
+    logger.info(f"[DETECT] {episode_key} model=retinaface loaded in {detector_time:.1f}s provider={detector.get_provider_info()}")
+
+    embedder_start = time.time()
+    logger.info(f"[DETECT] {episode_key} model=arcface loading...")
 
     embedder = ArcFaceEmbedder(
         provider_order=provider_order,
@@ -96,8 +212,8 @@ def detect_embed_task(job_id: str, episode_id: str) -> dict:
         fallback_scales=embedding_cfg.get("fallback_scales", [1.0, 1.2, 1.4]),
     )
 
-    logger.info(f"[{job_id}] Detector provider: {detector.get_provider_info()}")
-    logger.info(f"[{job_id}] Embedder provider: {embedder.get_provider_info()}")
+    embedder_time = time.time() - embedder_start
+    logger.info(f"[DETECT] {episode_key} model=arcface loaded in {embedder_time:.1f}s provider={embedder.get_provider_info()}")
 
     # Open video
     cap = cv2.VideoCapture(video_path)
@@ -336,10 +452,35 @@ def detect_embed_task(job_id: str, episode_id: str) -> dict:
             },
         )
 
+        # CRITICAL: Update envelope and registry on SUCCESS
+        logger.info(f"[DETECT] {episode_key} stage=end status=ok frames={detection_stats['frames_processed']} faces={detection_stats['faces_detected']}")
+
+        # Mark stage as complete in envelope
+        if job_id != "manual":
+            try:
+                job_manager.update_stage_status(
+                    job_id,
+                    "detect",
+                    "ok",
+                    result={
+                        "faces_detected": detection_stats["faces_detected"],
+                        "embeddings_computed": detection_stats["embeddings_computed"],
+                    },
+                )
+                logger.info(f"[DETECT] {episode_key} envelope stage=ok")
+            except Exception as e:
+                logger.error(f"[DETECT] {episode_key} Could not update envelope: {e}")
+
+        # Mark detected=true in registry
+        try:
+            job_manager.update_registry_state(episode_key, "detected", True)
+            logger.info(f"[DETECT] {episode_key} registry detected=true")
+        except Exception as e:
+            logger.error(f"[DETECT] {episode_key} ERR_REGISTRY_UPDATE_FAILED: {e}")
+            raise ValueError(f"ERR_REGISTRY_UPDATE_FAILED: Could not update registry for {episode_key}: {e}")
+
         # Enqueue next stage (tracking) - only for job workflow, not manual
         if job_id != "manual":
-            from api.jobs import job_manager
-
             job_manager.tracking_queue.enqueue(
                 "jobs.tasks.track.track_task",
                 job_id=job_id,
@@ -347,15 +488,31 @@ def detect_embed_task(job_id: str, episode_id: str) -> dict:
                 job_timeout="30m",
             )
 
-            logger.info(f"[{job_id}] Enqueued tracking task for {episode_id}")
+            logger.info(f"[DETECT] {episode_key} enqueued tracking task")
 
         return {
             "job_id": job_id,
             "episode_id": episode_id,
+            "episode_key": episode_key,
             "embeddings_path": str(embeddings_path),
             "stats_path": str(stats_path),
             "stats": dict(detection_stats),
         }
+
+    except Exception as e:
+        # CRITICAL: Update envelope and registry on FAILURE
+        logger.error(f"[DETECT] {episode_key} stage=end status=error error={str(e)}")
+
+        # Mark stage as error in envelope
+        if job_id != "manual":
+            try:
+                job_manager.update_stage_status(job_id, "detect", "error", error=str(e))
+                logger.info(f"[DETECT] {episode_key} envelope stage=error")
+            except Exception as env_err:
+                logger.error(f"[DETECT] {episode_key} Could not update envelope with error: {env_err}")
+
+        # Re-raise to propagate error
+        raise
 
     finally:
         cap.release()

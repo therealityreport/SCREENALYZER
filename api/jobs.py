@@ -514,6 +514,225 @@ class JobManager:
             return json.loads(data)
         return None
 
+    def write_job_envelope(self, job_id: str, envelope: dict) -> None:
+        """
+        Write job envelope to disk (idempotent, atomic).
+
+        Creates jobs/{job_id}/meta.json with job metadata.
+        Used for self-healing workers when Redis metadata expires.
+
+        Args:
+            job_id: Job ID (e.g., 'prepare_RHOBH_S05_E03_11062025')
+            envelope: Job envelope dict with job_id, episode_key, mode, stages
+        """
+        jobs_dir = DATA_ROOT / "jobs" / job_id
+        jobs_dir.mkdir(parents=True, exist_ok=True)
+
+        meta_file = jobs_dir / "meta.json"
+        tmp_file = jobs_dir / "meta.json.tmp"
+
+        # Atomic write
+        with open(tmp_file, "w") as f:
+            json.dump(envelope, f, indent=2)
+        tmp_file.replace(meta_file)
+
+    def load_job_envelope(self, job_id: str) -> Optional[dict]:
+        """
+        Load job envelope from disk.
+
+        Args:
+            job_id: Job ID
+
+        Returns:
+            Job envelope dict, or None if not found
+        """
+        meta_file = DATA_ROOT / "jobs" / job_id / "meta.json"
+        if not meta_file.exists():
+            return None
+
+        with open(meta_file) as f:
+            return json.load(f)
+
+    def update_stage_status(self, job_id: str, stage_key: str, status: str, result: Optional[dict] = None, error: Optional[str] = None) -> None:
+        """
+        Update stage status in job envelope.
+
+        Args:
+            job_id: Job ID
+            stage_key: Stage key (e.g., 'detect', 'track')
+            status: Stage status ('pending', 'running', 'ok', 'skipped', 'error')
+            result: Optional result dict for successful stages
+            error: Optional error message for failed stages
+        """
+        envelope = self.load_job_envelope(job_id)
+        if not envelope:
+            return
+
+        if "stages" not in envelope:
+            envelope["stages"] = {}
+
+        envelope["stages"][stage_key] = {"status": status}
+        if result:
+            envelope["stages"][stage_key]["result"] = result
+        if error:
+            envelope["stages"][stage_key]["error"] = error
+
+        self.write_job_envelope(job_id, envelope)
+
+
+
+    # ========================================================================
+    # Episode Registry Management
+    # ========================================================================
+
+    def normalize_episode_key(self, episode_id: str) -> str:
+        """
+        Normalize episode ID to canonical key format.
+
+        Converts RHOBH_S05_E03_11062025 -> rhobh_s05_e03
+        Converts ANOTHER_SHOW_S02_E05_99999999 -> another_show_s02_e05
+        Strips timestamp and lowercases.
+
+        Args:
+            episode_id: Episode ID in any format
+
+        Returns:
+            Canonical episode key (lowercase, underscores, no timestamp)
+        """
+        import re
+
+        # Find season (S##) and episode (E##) patterns
+        season_match = re.search(r'(S\d+)', episode_id, re.IGNORECASE)
+        episode_match = re.search(r'(E\d+)', episode_id, re.IGNORECASE)
+
+        if season_match and episode_match:
+            # Extract show name (everything before season)
+            season_pos = season_match.start()
+            show_part = episode_id[:season_pos].rstrip("_")
+
+            # Build canonical key: show_season_episode
+            canonical = f"{show_part}_{season_match.group(1)}_{episode_match.group(1)}".lower()
+            return canonical
+
+        # Fallback: just lowercase
+        return episode_id.lower()
+
+    def write_episode_registry(self, episode_key: str, registry_data: dict) -> None:
+        """
+        Write episode registry to disk (idempotent, atomic).
+
+        Creates episodes/{episode_key}/state.json with episode state.
+
+        Args:
+            episode_key: Canonical episode key (e.g., 'rhobh_s05_e03')
+            registry_data: Registry dict with states, paths, timestamps
+        """
+        episodes_dir = DATA_ROOT / "episodes" / episode_key
+        episodes_dir.mkdir(parents=True, exist_ok=True)
+
+        state_file = episodes_dir / "state.json"
+        tmp_file = episodes_dir / "state.json.tmp"
+
+        # Ensure timestamps
+        if "timestamps" not in registry_data:
+            registry_data["timestamps"] = {}
+        registry_data["timestamps"]["last_modified"] = datetime.utcnow().isoformat() + 'Z'
+
+        # Atomic write
+        with open(tmp_file, "w") as f:
+            json.dump(registry_data, f, indent=2)
+        tmp_file.replace(state_file)
+
+    def load_episode_registry(self, episode_key: str) -> Optional[dict]:
+        """
+        Load episode registry from disk.
+
+        Args:
+            episode_key: Canonical episode key
+
+        Returns:
+            Registry dict, or None if not found
+        """
+        state_file = DATA_ROOT / "episodes" / episode_key / "state.json"
+        if not state_file.exists():
+            return None
+
+        with open(state_file) as f:
+            return json.load(f)
+
+    def update_registry_state(self, episode_key: str, state_name: str, value: bool) -> None:
+        """
+        Update a specific state in the episode registry.
+
+        Args:
+            episode_key: Canonical episode key
+            state_name: State name (e.g., 'detected', 'tracked', 'clustered')
+            value: State value (True/False)
+        """
+        registry = self.load_episode_registry(episode_key)
+        if not registry:
+            return
+
+        if "states" not in registry:
+            registry["states"] = {}
+
+        registry["states"][state_name] = value
+        self.write_episode_registry(episode_key, registry)
+
+    def ensure_episode_registry(self, episode_id: str, video_path: str) -> str:
+        """
+        Ensure episode registry exists, create if missing.
+
+        Args:
+            episode_id: Episode ID (e.g., 'RHOBH_S05_E03_11062025')
+            video_path: Path to video file
+
+        Returns:
+            Canonical episode_key
+        """
+        episode_key = self.normalize_episode_key(episode_id)
+        registry = self.load_episode_registry(episode_key)
+
+        if not registry:
+            # Parse episode components
+            parts = episode_id.split("_")
+            show = parts[0].upper() if len(parts) > 0 else "UNKNOWN"
+            season = parts[1].upper() if len(parts) > 1 else "S00"
+            episode = parts[2].upper() if len(parts) > 2 else "E00"
+
+            # Create new registry
+            registry = {
+                "episode_key": episode_key,
+                "episode_id": episode_id,
+                "show": show,
+                "season": season,
+                "episode": episode,
+                "video_path": video_path,
+                "paths": {
+                    "root": f"data/harvest/{episode_id}",
+                    "frames_dir": f"data/harvest/{episode_id}/frames",
+                    "manifests_dir": f"data/harvest/{episode_id}/diagnostics",
+                },
+                "contracts": {
+                    "frame_ext": "jpg",
+                    "frame_pad": 6,
+                },
+                "states": {
+                    "validated": False,
+                    "extracted_frames": False,
+                    "detected": False,
+                    "tracked": False,
+                    "clustered": False,
+                    "assigned": False,
+                },
+                "timestamps": {
+                    "created": datetime.utcnow().isoformat() + 'Z',
+                },
+            }
+            self.write_episode_registry(episode_key, registry)
+
+        return episode_key
+
 
 # Global job manager instance
 job_manager = JobManager(redis_conn)

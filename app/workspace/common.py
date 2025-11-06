@@ -9,6 +9,7 @@ from typing import Dict, Any, Optional, Iterable, List, Sequence, Tuple
 import streamlit as st
 
 from screentime.viz.thumbnails import ThumbnailGenerator
+from screentime.viz.frame_index import load_frames_index
 
 PLACEHOLDER_DATA_URI = (
     "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAJYAAADICAIAAACF548yAAAB5UlEQVR4nO3RMQ0AIQDAQHhDbKz4d/UiGEiTOwVNOtc+g7LvdQC3LMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzcNT9eYoCNCvOwuYAAAAASUVORK5CYII="
@@ -108,6 +109,9 @@ def track_preview_image(
     if not track:
         return PLACEHOLDER_DATA_URI
 
+    data_root = getattr(thumb_gen, "data_root", Path("data"))
+    frame_index = load_frames_index(episode_id, data_root)
+
     for ref in track.get("frame_refs", []) or []:
         bbox = ref.get("bbox")
         if not bbox:
@@ -118,6 +122,7 @@ def track_preview_image(
             bbox,
             episode_id,
             track["track_id"],
+            frame_index=frame_index,
         )
         if thumb_path:
             return str(thumb_path)
@@ -135,6 +140,8 @@ def track_frame_images(
 
     frame_ids: List[int] = []
     images: List[str] = []
+    data_root = getattr(thumb_gen, "data_root", Path("data"))
+    frame_index = load_frames_index(episode_id, data_root)
     for ref in track.get("frame_refs", []) or []:
         frame_id = int(ref.get("frame_id"))
         bbox = ref.get("bbox")
@@ -146,6 +153,7 @@ def track_frame_images(
                 bbox,
                 episode_id,
                 track["track_id"],
+                frame_index=frame_index,
             )
             images.append(str(thumb_path) if thumb_path else PLACEHOLDER_DATA_URI)
         else:

@@ -139,6 +139,15 @@ def purge_all_episodes_dialog():
 
                 st.session_state["_show_purge_dialog"] = False
                 st.session_state["_purge_complete"] = True
+
+                # Clear all caches to force registry reload
+                st.cache_data.clear()
+                st.cache_resource.clear()
+
+                # Clear episode selection
+                st.session_state.pop("workspace_episode", None)
+                st.session_state.pop("episode_id", None)
+
                 st.rerun()
 
             except Exception as e:
@@ -267,20 +276,89 @@ def main():
     can_run = pipeline_check.get("can_run", True)
     block_reason = pipeline_check.get("reason", "")
 
+    # Phase 3 P1: Check extraction status from episode registry
+    extraction_ready = False
+    episode_state = None
+    if current_ep:
+        from api.episodes import get_episode_state
+        episode_state = get_episode_state(current_ep)
+        extraction_ready = episode_state.get("states", {}).get("extracted_frames", False)
+
+        # Auto-refresh while extraction is in progress
+        if not extraction_ready:
+            # Check if extraction is actually running or just pending
+            validated = episode_state.get("states", {}).get("validated", False)
+
+            if validated:
+                # Validated but not extracted yet - poll for completion
+                import time
+
+                # Add auto-refresh banner
+                st.info("⏳ Frame extraction in progress... Page will refresh automatically.")
+
+                # Wait a bit then refresh (simulates polling)
+                poll_interval = 2  # seconds
+                if "last_poll_time" not in st.session_state:
+                    st.session_state["last_poll_time"] = time.time()
+
+                elapsed = time.time() - st.session_state["last_poll_time"]
+
+                if elapsed >= poll_interval:
+                    st.session_state["last_poll_time"] = time.time()
+                    st.rerun()
+
+                # Show progress placeholder
+                with st.empty():
+                    st.caption(f"Checking again in {max(0, poll_interval - int(elapsed))} seconds...")
+                    time.sleep(0.5)
+                    st.rerun()
+
     with header_cols[0]:
-        prepare_help = "Run detect/embed → track → generate face stills"
-        if not can_run:
-            prepare_help = f"Blocked: {block_reason}"
-        
-        if st.button(
-            "🔄 Prepare Tracks & Stills",
-            type="primary",
-            help=prepare_help,
-            key="workspace_prepare_btn",
-            use_container_width=True,
-            disabled=not can_run,
-        ):
-            st.session_state["_trigger_prepare"] = True
+        # Phase 3 P1: Conditional Prepare based on extraction status
+        if extraction_ready:
+            # Frames ready - show manual prepare for re-running detection
+            prepare_help = "Re-run detection and tracking (frames already extracted)"
+            if not can_run:
+                prepare_help = f"Blocked: {block_reason}"
+
+            if st.button(
+                "🔄 Prepare Tracks & Stills",
+                type="secondary",
+                help=prepare_help,
+                key="workspace_prepare_btn",
+                use_container_width=True,
+                disabled=not can_run,
+            ):
+                st.session_state["_trigger_prepare"] = True
+        else:
+            # Frames not extracted yet - show passive message
+            st.info("⏳ Extracting frames...")
+            st.caption("This happens automatically after upload validation")
+
+            # Add manual trigger in case auto-extraction failed
+            if st.button(
+                "⚠️ Retry Extraction",
+                type="primary",
+                use_container_width=True,
+                help="Manual frame extraction if auto-extraction failed"
+            ):
+                from jobs.tasks.auto_extract import trigger_auto_extraction
+                with st.spinner("Extracting frames..."):
+                    try:
+                        from pathlib import Path
+                        video_path = episode_state.get("video_path", "")
+                        if not video_path or not Path(video_path).exists():
+                            st.error(f"❌ Video file not found: {video_path}")
+                        else:
+                            result = trigger_auto_extraction(current_ep, video_path)
+                            if result.get("success"):
+                                st.success("✅ Extraction complete!")
+                                st.rerun()
+                            else:
+                                st.error(f"❌ Extraction failed: {result.get('error')}")
+                    except Exception as e:
+                        st.error(f"❌ Extraction error: {str(e)}")
+
 
     with header_cols[1]:
         cluster_disabled = not can_run or not artifact_status["prepared"]

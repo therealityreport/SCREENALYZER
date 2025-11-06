@@ -15,6 +15,8 @@ import cv2
 import numpy as np
 from PIL import Image
 
+from screentime.viz.frame_index import FrameIndex, load_frames_index
+
 logger = logging.getLogger(__name__)
 
 
@@ -56,6 +58,7 @@ class ThumbnailGenerator:
         cache_dir: Path,
         thumbnail_size: tuple[int, int] = (160, 200),
         cache_enabled: bool = True,
+        data_root: Optional[Path] = None,
     ):
         """
         Initialize thumbnail generator.
@@ -65,9 +68,17 @@ class ThumbnailGenerator:
             thumbnail_size: Target thumbnail size (width, height) - default 160×200 for 4:5
             cache_enabled: Whether to use cache
         """
+        cache_dir = Path(cache_dir)
         self.cache_dir = cache_dir
         self.thumbnail_size = thumbnail_size
         self.cache_enabled = cache_enabled
+        if data_root is None:
+            try:
+                self.data_root = cache_dir.parents[1]
+            except IndexError:
+                self.data_root = Path("data")
+        else:
+            self.data_root = Path(data_root)
 
         if cache_enabled:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -79,6 +90,8 @@ class ThumbnailGenerator:
         bbox: list[int],
         episode_id: str,
         cluster_id: int,
+        *,
+        frame_index: FrameIndex | None = None,
     ) -> Optional[Path]:
         """
         Generate thumbnail for a face detection.
@@ -101,15 +114,24 @@ class ThumbnailGenerator:
         if self.cache_enabled and cache_path.exists():
             return cache_path
 
-        # Extract frame
-        cap = cv2.VideoCapture(str(video_path))
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
-        ret, frame = cap.read()
-        cap.release()
+        frame_img = None
+        source_index: Optional[FrameIndex] = frame_index or load_frames_index(episode_id, self.data_root)
+        if source_index:
+            frame_path = source_index.resolve_path(frame_id)
+            if frame_path:
+                frame_img = cv2.imread(str(frame_path))
+                if frame_img is None:
+                    logger.warning("Failed to read frame asset %s; falling back to video", frame_path)
 
-        if not ret:
-            logger.warning(f"Failed to extract frame {frame_id} from {video_path}")
-            return None
+        if frame_img is None:
+            cap = cv2.VideoCapture(str(video_path))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
+            ret, frame_img = cap.read()
+            cap.release()
+
+            if not ret or frame_img is None:
+                logger.warning(f"Failed to extract frame {frame_id} from {video_path}")
+                return None
 
         # Crop face with padding
         x1, y1, x2, y2 = bbox
@@ -122,10 +144,10 @@ class ThumbnailGenerator:
         # Apply padding with bounds check
         x1_pad = max(0, x1 - pad_w)
         y1_pad = max(0, y1 - pad_h)
-        x2_pad = min(frame.shape[1], x2 + pad_w)
-        y2_pad = min(frame.shape[0], y2 + pad_h)
+        x2_pad = min(frame_img.shape[1], x2 + pad_w)
+        y2_pad = min(frame_img.shape[0], y2 + pad_h)
 
-        face_crop = frame[y1_pad:y2_pad, x1_pad:x2_pad]
+        face_crop = frame_img[y1_pad:y2_pad, x1_pad:x2_pad]
 
         if face_crop.size == 0:
             logger.warning(f"Empty crop for frame {frame_id}, bbox {bbox}")
@@ -154,6 +176,8 @@ class ThumbnailGenerator:
         bbox: list[int],
         episode_id: str,
         track_id: int,
+        *,
+        frame_index: FrameIndex | None = None,
     ) -> Optional[Path]:
         """
         Generate thumbnail for a single frame/track.
@@ -168,7 +192,14 @@ class ThumbnailGenerator:
         Returns:
             Path to thumbnail image, or None if failed
         """
-        return self.generate_thumbnail(video_path, frame_id, bbox, episode_id, track_id)
+        return self.generate_thumbnail(
+            video_path,
+            frame_id,
+            bbox,
+            episode_id,
+            track_id,
+            frame_index=frame_index,
+        )
 
     def generate_cluster_thumbnail(
         self,
@@ -195,6 +226,7 @@ class ThumbnailGenerator:
         track_ids = cluster["track_ids"][:max_samples]
 
         thumbnails = []
+        index = load_frames_index(episode_id, self.data_root)
 
         for track_id in track_ids:
             # Find track
@@ -214,7 +246,14 @@ class ThumbnailGenerator:
             bbox = ref["bbox"]
 
             # Generate thumbnail
-            thumb_path = self.generate_thumbnail(video_path, frame_id, bbox, episode_id, cluster_id)
+            thumb_path = self.generate_thumbnail(
+                video_path,
+                frame_id,
+                bbox,
+                episode_id,
+                cluster_id,
+                frame_index=index,
+            )
             if thumb_path:
                 thumbnails.append(thumb_path)
 
