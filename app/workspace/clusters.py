@@ -20,10 +20,10 @@ from app.workspace.actions import (
 from app.workspace.common import (
     PLACEHOLDER_DATA_URI,
     ensure_workspace_styles,
-    get_episode_hash,
     get_thumbnail_generator,
     track_frame_images,
 )
+from app.lib.registry import get_episode_hash
 from app.utils.ui_keys import wkey
 from screentime.utils import get_video_path
 

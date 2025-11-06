@@ -171,7 +171,7 @@ def _load_stills_manifest(episode_id: str, episode_hash: str | None = None) -> d
     """
     # Get episode_hash if not provided
     if episode_hash is None:
-        from app.workspace.common import get_episode_hash
+        from app.lib.registry import get_episode_hash
         episode_hash = get_episode_hash(episode_id, DATA_ROOT) or "none"
     
     cache_key = f"{episode_id}:{episode_hash}"
