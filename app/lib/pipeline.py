@@ -3,8 +3,11 @@ Pipeline helpers for checking artifact status and managing pipeline state.
 """
 
 import json
+import logging
 from pathlib import Path
 from typing import Any, Dict, Union
+
+logger = logging.getLogger(__name__)
 
 def check_artifacts_status(episode_id: str, data_root: Union[Path, str] = Path("data")) -> Dict[str, Any]:
     """
