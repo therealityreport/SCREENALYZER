@@ -497,3 +497,49 @@ def format_eta(eta_seconds: float) -> str:
         return f"{minutes}m {seconds}s"
     else:
         return f"{seconds}s"
+
+
+def cancel_pipeline(episode_id: str, data_root: Union[Path, str] = Path("data")) -> bool:
+    """
+    Cancel a running pipeline by updating pipeline_state.json.
+
+    Sets status to "cancelled" and clears maintenance mode.
+
+    Args:
+        episode_id: Episode whose pipeline to cancel
+        data_root: Data root directory
+
+    Returns:
+        True if cancelled successfully, False if no pipeline was running
+    """
+    data_root = Path(data_root)
+    diagnostics_dir = data_root / "harvest" / episode_id / "diagnostics"
+    state_file = diagnostics_dir / "pipeline_state.json"
+
+    if not state_file.exists():
+        return False
+
+    try:
+        with open(state_file, "r") as f:
+            state = json.load(f)
+
+        status = state.get("status", "")
+        if status != "running":
+            return False
+
+        # Update to cancelled state
+        state["status"] = "cancelled"
+        state["message"] = "Pipeline cancelled by user"
+        state["maintenance_mode"] = False
+        state.pop("active_op", None)
+        state.pop("active_op_progress", None)
+
+        with open(state_file, "w") as f:
+            json.dump(state, f, indent=2)
+
+        logger.info(f"Cancelled pipeline for {episode_id}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to cancel pipeline for {episode_id}: {e}")
+        return False

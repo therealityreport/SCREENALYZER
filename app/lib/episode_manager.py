@@ -732,3 +732,88 @@ def purge_all_episodes(
 
     logger.info(f"Purge complete: {stats['episodes_purged']} episodes archived")
     return stats
+
+
+def delete_video_file(
+    episode_id: str,
+    actor: str = "user",
+    reason: str = "",
+) -> Dict[str, Any]:
+    """
+    Permanently delete the video file for an episode.
+
+    Does NOT require pipeline to be stopped. Simply deletes the video file
+    from disk and updates diagnostics.
+
+    Args:
+        episode_id: Episode whose video to delete
+        actor: Who is performing the deletion
+        reason: Why the deletion is being performed
+
+    Returns:
+        Dict with deletion results:
+            - deleted: True if file was deleted
+            - video_path: Path that was deleted (or would have been)
+            - file_existed: True if file existed before deletion
+            - error: Error message if deletion failed
+    """
+    from datetime import datetime
+    import json
+    from pathlib import Path
+
+    # Load episodes.json to find video path
+    episodes_json = Path("data/diagnostics/episodes.json")
+    video_path = None
+    file_existed = False
+    deleted = False
+    error = None
+
+    if episodes_json.exists():
+        try:
+            with open(episodes_json, "r") as f:
+                episodes_data = json.load(f)
+
+            for ep_data in episodes_data.get("episodes", []):
+                if ep_data.get("episode_id") == episode_id:
+                    video_path = ep_data.get("video_path")
+                    break
+        except Exception as e:
+            error = f"Failed to read episodes.json: {e}"
+
+    if not video_path:
+        error = f"Video path not found for episode {episode_id}"
+
+    # Try to delete the video file
+    if video_path:
+        video_file = Path(video_path)
+        file_existed = video_file.exists()
+
+        if file_existed:
+            try:
+                video_file.unlink()
+                deleted = True
+                logger.info(f"Deleted video file: {video_path}")
+            except Exception as e:
+                error = f"Failed to delete video file: {e}"
+                logger.error(error)
+
+    # Emit audit event
+    try:
+        emit_episode_op_event(
+            op_type="delete_video",
+            episode_id=episode_id,
+            before_state={"video_path": str(video_path) if video_path else None, "existed": file_existed},
+            after_state={"deleted": deleted},
+            actor=actor,
+            reason=reason or "Deleted video file",
+            metadata={"error": error} if error else {},
+        )
+    except Exception:
+        pass  # Don't fail if audit logging fails
+
+    return {
+        "deleted": deleted,
+        "video_path": str(video_path) if video_path else None,
+        "file_existed": file_existed,
+        "error": error,
+    }

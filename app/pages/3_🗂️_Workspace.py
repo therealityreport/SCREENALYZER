@@ -22,6 +22,7 @@ from app.lib.pipeline import (
     get_maintenance_reason,
     calculate_eta,
     format_eta,
+    cancel_pipeline,
 )
 from app.components.episode_manager_modal import episode_manager_modal
 from app.workspace.faces import render_faces_tab
@@ -37,7 +38,7 @@ from app.lib.registry import (
     get_default_episode,
     load_episodes_json
 )
-from app.lib.episode_manager import purge_all_episodes
+from app.lib.episode_manager import purge_all_episodes, delete_video_file
 
 # Page config
 st.set_page_config(
@@ -495,7 +496,17 @@ def main():
         else:
             # Running state
             overall_pct = (step_index / total_steps) if total_steps > 0 else 0.0
-            st.info(f"🔄 {current_step} ({step_index}/{total_steps})")
+
+            col_status, col_cancel = st.columns([4, 1])
+            with col_status:
+                st.info(f"🔄 {current_step} ({step_index}/{total_steps})")
+            with col_cancel:
+                if st.button("⏹️ Cancel Pipeline", key="cancel_pipeline_btn", type="secondary", use_container_width=True):
+                    if cancel_pipeline(selected_episode, DATA_ROOT):
+                        st.success("✅ Pipeline cancelled")
+                        safe_rerun()
+                    else:
+                        st.error("❌ Failed to cancel pipeline")
 
             if message:
                 st.caption(message)

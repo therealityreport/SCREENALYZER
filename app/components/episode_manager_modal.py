@@ -25,6 +25,7 @@ from app.lib.episode_manager import (
     restore_episode,
     rehash_episode,
     list_episodes as list_eps_manager,
+    delete_video_file,
 )
 from app.lib.pipeline import (
     check_pipeline_can_run,
@@ -376,6 +377,84 @@ def _render_rehash_tab(episode_id: str, data_root: Path, can_run: bool, block_re
             st.error(f"❌ Rehash failed: {str(e)}")
 
 
+def _render_delete_video_tab(episode_id: str, data_root: Path):
+    """Render Delete Video tab - permanently delete video file (no pipeline gate)."""
+    st.markdown("### Delete Video File")
+    st.warning("⚠️ This will **permanently** delete the video file from disk.")
+
+    st.markdown("""
+    **What happens:**
+    - Video file is **permanently deleted** (cannot be recovered)
+    - Harvest data, clusters, and stills remain intact
+    - Pipeline data is NOT affected
+    - **No pipeline check** - can delete even while pipeline is running
+    - Audit event logged to migrations.jsonl
+    """)
+
+    # Get video path
+    video_path = None
+    try:
+        import json
+        episodes_json = data_root / "diagnostics" / "episodes.json"
+        if episodes_json.exists():
+            with open(episodes_json, "r") as f:
+                episodes_data = json.load(f)
+            for ep_data in episodes_data.get("episodes", []):
+                if ep_data.get("episode_id") == episode_id:
+                    video_path = ep_data.get("video_path")
+                    break
+    except Exception:
+        pass
+
+    if video_path:
+        from pathlib import Path
+        video_file = Path(video_path)
+        exists = video_file.exists()
+
+        st.info(f"**Video path:** `{video_path}`")
+
+        if exists:
+            try:
+                size_mb = video_file.stat().st_size / (1024 * 1024)
+                st.info(f"**File size:** {size_mb:.1f} MB")
+            except Exception:
+                pass
+
+            st.error("**Status:** File exists and will be deleted")
+        else:
+            st.success("**Status:** File already deleted or not found")
+    else:
+        st.warning("**Status:** Video path not found in episodes.json")
+
+    understand = st.checkbox(
+        "I understand this will permanently delete the video file",
+        key="modal_delete_video_understand"
+    )
+
+    reason = st.text_input("Reason (optional)", key="modal_delete_video_reason")
+
+    if st.button(
+        "🗑️ Delete Video File",
+        key="modal_confirm_delete_video_btn",
+        type="primary",
+        disabled=not understand,
+        use_container_width=True,
+    ):
+        try:
+            with st.spinner(f"Deleting video for {episode_id}..."):
+                result = delete_video_file(episode_id, actor="user", reason=reason)
+
+            if result.get("deleted"):
+                st.success(f"✅ Deleted video file: {result['video_path']}")
+            elif not result.get("file_existed"):
+                st.info(f"ℹ️ Video file was already deleted: {result['video_path']}")
+            else:
+                st.error(f"❌ Failed to delete: {result.get('error', 'Unknown error')}")
+
+        except Exception as e:
+            st.error(f"❌ Delete failed: {str(e)}")
+
+
 @st.dialog("Manage Episode", width="large")
 def episode_manager_modal(episode_id: str, data_root: Path = Path("data")):
     """
@@ -401,7 +480,7 @@ def episode_manager_modal(episode_id: str, data_root: Path = Path("data")):
     # Tabs
     tab = st.radio(
         "Operation",
-        ["Info", "Move", "Remove", "Restore", "Rehash"],
+        ["Info", "Move", "Remove", "Restore", "Rehash", "Delete Video"],
         horizontal=True,
         label_visibility="collapsed",
         key="modal_tab_selector",
@@ -418,8 +497,10 @@ def episode_manager_modal(episode_id: str, data_root: Path = Path("data")):
         _render_remove_tab(episode_id, data_root, can_run, block_reason)
     elif tab == "Restore":
         _render_restore_tab(episode_id, data_root, can_run, block_reason)
-    else:  # Rehash
+    elif tab == "Rehash":
         _render_rehash_tab(episode_id, data_root, can_run, block_reason)
+    else:  # Delete Video
+        _render_delete_video_tab(episode_id, data_root)
 
     # Close button at bottom
     st.markdown("---")
