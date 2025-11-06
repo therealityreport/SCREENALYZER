@@ -182,3 +182,81 @@ def ensure_episode_in_registry(ep_id: str, show_id: str = "rhobh", season_id: st
 
         save_registry(reg)
         st.toast(f"Recovered episode {ep_id}", icon="✅")
+
+
+def load_episodes_json() -> dict:
+    """
+    Load episodes from diagnostics/episodes.json.
+
+    Returns:
+        Dict with 'episodes' list, or empty structure if file doesn't exist
+    """
+    episodes_path = DATA_ROOT / "diagnostics" / "episodes.json"
+
+    if not episodes_path.exists():
+        return {"episodes": []}
+
+    try:
+        with open(episodes_path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {"episodes": []}
+
+
+def get_newest_episode(episodes_data: dict | None = None) -> str | None:
+    """
+    Get the most recently uploaded episode from diagnostics/episodes.json.
+
+    Args:
+        episodes_data: Optional pre-loaded episodes data. If None, loads fresh.
+
+    Returns:
+        Episode ID of newest episode, or None if no episodes exist
+    """
+    if episodes_data is None:
+        episodes_data = load_episodes_json()
+
+    episodes = episodes_data.get("episodes", [])
+    if not episodes:
+        return None
+
+    # Sort by uploaded_at descending
+    sorted_eps = sorted(
+        episodes,
+        key=lambda e: e.get("uploaded_at", ""),
+        reverse=True
+    )
+
+    return sorted_eps[0].get("episode_id") if sorted_eps else None
+
+
+def get_default_episode(available_episodes: list[str]) -> str | None:
+    """
+    Get the default episode to select in dropdowns.
+
+    Prefers:
+    1. Current session state episode_id if still valid
+    2. Newest episode from diagnostics/episodes.json
+    3. First available episode from list
+
+    Args:
+        available_episodes: List of episode IDs that are valid choices
+
+    Returns:
+        Episode ID to select, or None if no episodes available
+    """
+    if not available_episodes:
+        return None
+
+    # Check if current selection is still valid
+    current = st.session_state.get("episode_id")
+    if current and current in available_episodes:
+        return current
+
+    # Try newest from diagnostics
+    newest = get_newest_episode()
+    if newest and newest in available_episodes:
+        return newest
+
+    # Fallback to first available
+    return available_episodes[0]

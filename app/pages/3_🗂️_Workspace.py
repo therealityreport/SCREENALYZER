@@ -20,6 +20,8 @@ from app.lib.pipeline import (
     is_pipeline_running,
     check_pipeline_can_run,
     get_maintenance_reason,
+    calculate_eta,
+    format_eta,
 )
 from app.components.episode_manager_modal import episode_manager_modal
 from app.workspace.faces import render_faces_tab
@@ -31,8 +33,11 @@ from app.lib.registry import (
     load_registry,
     get_all_episodes,
     recover_episodes_from_fs,
-    ensure_episode_in_registry
+    ensure_episode_in_registry,
+    get_default_episode,
+    load_episodes_json
 )
+from app.lib.episode_manager import purge_all_episodes
 
 # Page config
 st.set_page_config(
@@ -55,6 +60,88 @@ def init_workspace_state():
         st.session_state.workspace_selected_person = None
     if "workspace_selected_cluster" not in st.session_state:
         st.session_state.workspace_selected_cluster = None
+
+
+@st.dialog("⚠️ Purge All Episodes", width="large")
+def purge_all_episodes_dialog():
+    """Confirmation dialog for purging all episodes."""
+    st.warning("**WARNING:** This will permanently archive ALL episodes!")
+
+    st.markdown("""
+    **What will happen:**
+    - All episodes will be removed from `diagnostics/episodes.json`
+    - `data/harvest/<episode>/` will be moved to `data/archive/episodes/<episode>_<timestamp>/`
+    - `data/outputs/<episode>/` will be moved to `data/archive/episodes/<episode>_<timestamp>/`
+    - Optionally archive video files (you can choose below)
+    - **Facebank and show registry will NOT be touched**
+
+    **This cannot be easily undone.**
+    """)
+
+    archive_videos = st.checkbox(
+        "Also archive video files (recommended to keep videos)",
+        value=False,
+        key="purge_archive_videos"
+    )
+
+    understand = st.checkbox(
+        "I understand this will archive ALL episodes",
+        key="purge_understand"
+    )
+
+    confirm_text = st.text_input(
+        'Type "PURGE ALL" to confirm:',
+        key="purge_confirm_text"
+    )
+
+    reason = st.text_area(
+        "Reason (optional)",
+        key="purge_reason",
+        placeholder="e.g., Starting fresh with new episode uploads"
+    )
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if st.button("Cancel", key="purge_cancel_btn", use_container_width=True):
+            st.session_state["_show_purge_dialog"] = False
+            st.rerun()
+
+    with col2:
+        confirm_valid = understand and confirm_text == "PURGE ALL"
+
+        if st.button(
+            "✅ Confirm Purge",
+            key="purge_confirm_btn",
+            type="primary",
+            disabled=not confirm_valid,
+            use_container_width=True,
+        ):
+            try:
+                with st.spinner("Purging all episodes..."):
+                    stats = purge_all_episodes(
+                        archive_videos=archive_videos,
+                        actor="user",
+                        reason=reason or "Purged all episodes to start fresh"
+                    )
+
+                st.success(f"✅ Purged {stats['episodes_purged']} episodes successfully!")
+
+                if stats['errors']:
+                    st.warning(f"⚠️ Encountered {len(stats['errors'])} errors:")
+                    for err in stats['errors']:
+                        st.markdown(f"- {err}")
+
+                # Show summary
+                with st.expander("Purge Summary"):
+                    st.json(stats)
+
+                st.session_state["_show_purge_dialog"] = False
+                st.session_state["_purge_complete"] = True
+                st.rerun()
+
+            except Exception as e:
+                st.error(f"❌ Purge failed: {str(e)}")
 
 
 def main():
@@ -160,12 +247,13 @@ def main():
                 )
 
     # Header row: Pipeline buttons + Episode selector
-    header_cols = st.columns([1.2, 1, 1, 3])
+    header_cols = st.columns([1.2, 1, 1, 2.5, 0.5])
 
     # Import pipeline helpers
 
-    # Get current episode and check status
-    current_ep = st.session_state.get("episode_id", episode_ids[0] if episode_ids else None)
+    # Get default episode using smart selection
+    default_ep = get_default_episode(episode_ids)
+    current_ep = st.session_state.get("episode_id", default_ep)
     pipeline_running = is_pipeline_running(current_ep, DATA_ROOT) if current_ep else False
     artifact_status = check_artifacts_status(current_ep, DATA_ROOT) if current_ep else {
         "prepared": False,
@@ -229,21 +317,49 @@ def main():
 
 
     with header_cols[3]:
+        # Use get_default_episode for smart selection
+        default_idx = 0
+        if default_ep and default_ep in episode_ids:
+            default_idx = episode_ids.index(default_ep)
+        elif st.session_state.workspace_episode in episode_ids:
+            default_idx = episode_ids.index(st.session_state.workspace_episode)
+
         selected_episode = st.selectbox(
             "Episode",
             options=episode_ids,
-            index=episode_ids.index(st.session_state.workspace_episode)
-            if st.session_state.workspace_episode in episode_ids
-            else 0,
+            index=default_idx,
             key="workspace_episode_selector",
             label_visibility="collapsed"
         )
 
+    with header_cols[4]:
+        if st.button("↻", key="refresh_episodes_btn", help="Refresh episode list", use_container_width=True):
+            # Clear episode cache and reload
+            st.session_state.pop("episode_id", None)
+            st.cache_data.clear()
+            safe_rerun()
+
 
     # Manage Episode button - opens modal
-    if current_ep:
-        if st.button("🔧 Manage Episode", key="manage_episode_btn", use_container_width=False):
-            episode_manager_modal(current_ep, DATA_ROOT)
+    col_manage, col_purge = st.columns([1, 1])
+
+    with col_manage:
+        if current_ep:
+            if st.button("🔧 Manage Episode", key="manage_episode_btn", use_container_width=False):
+                episode_manager_modal(current_ep, DATA_ROOT)
+
+    with col_purge:
+        if st.button("🗑️ Remove ALL Episodes", key="purge_all_btn", use_container_width=False, type="secondary"):
+            st.session_state["_show_purge_dialog"] = True
+
+    # Show purge dialog if triggered
+    if st.session_state.get("_show_purge_dialog"):
+        purge_all_episodes_dialog()
+
+    # Show success message if purge just completed
+    if st.session_state.pop("_purge_complete", False):
+        st.success("✅ All episodes have been purged. Episode dropdowns will be empty until new episodes are uploaded.")
+        safe_rerun()
 
     # Update session state if episode changed
     if selected_episode != st.session_state.workspace_episode:
@@ -386,17 +502,54 @@ def main():
 
             # Per-stage progress bars
             stages = ["Detect/Embed", "Track", "Cluster", "Generate Stills", "Analytics"]
+            # Map display names to step keys used in stats
+            step_keys = ["detect", "track", "cluster", "stills", "analytics"]
 
             for i, stage_name in enumerate(stages, start=1):
                 if i < step_index:
                     # Completed
                     st.progress(1.0, text=f"✅ {stage_name}")
                 elif i == step_index:
-                    # Current
+                    # Current - add ETA if available
                     stage_pct = pipeline_state.get("pct", 0.5)
                     if stage_pct is None:
                         stage_pct = 0.5
-                    st.progress(float(stage_pct), text=f"⏳ {stage_name}")
+
+                    # Calculate ETA for current step
+                    try:
+                        step_key = step_keys[i - 1]
+                        operation = "prepare"  # Default operation
+
+                        # Determine operation type from pipeline state
+                        if "cluster" in current_step.lower():
+                            operation = "cluster"
+                        elif "analyt" in current_step.lower():
+                            operation = "analytics"
+
+                        # Get remaining steps
+                        remaining_steps = [step_keys[j] for j in range(i, len(step_keys))]
+
+                        eta_info = calculate_eta(
+                            selected_episode,
+                            operation,
+                            step_key,
+                            remaining_steps,
+                            current_step_elapsed_s=0.0,
+                            data_root=DATA_ROOT
+                        )
+
+                        eta_seconds = eta_info.get("eta_seconds", 0)
+                        confidence = eta_info.get("confidence", "none")
+
+                        if confidence == "none" or eta_seconds <= 0:
+                            eta_text = " • learning ETA..."
+                        else:
+                            eta_formatted = format_eta(eta_seconds)
+                            eta_text = f" • ETA: ~{eta_formatted}"
+                    except Exception:
+                        eta_text = ""
+
+                    st.progress(float(stage_pct), text=f"⏳ {stage_name}{eta_text}")
                 else:
                     # Pending
                     st.progress(0.0, text=f"⏸️ {stage_name}")

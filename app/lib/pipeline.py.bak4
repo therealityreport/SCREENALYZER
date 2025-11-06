@@ -1,0 +1,223 @@
+"""
+Pipeline helpers for checking artifact status and managing pipeline state.
+"""
+
+import json
+from pathlib import Path
+from typing import Any, Dict, Union
+
+def check_artifacts_status(episode_id: str, data_root: Union[Path, str] = Path("data")) -> Dict[str, Any]:
+    """
+    Check which pipeline artifacts exist for an episode.
+
+    Returns:
+        Dict with keys:
+        - prepared: bool - True if tracks.json exists
+        - has_clusters: bool - True if clusters.json exists
+        - has_analytics: bool - True if timeline.csv exists
+        - missing_message: str - Human-readable message about what's missing
+        - next_action: str - What action to take next ("prepare", "cluster", "analyze", or "ready")
+    """
+    data_root = Path(data_root)
+    harvest_dir = data_root / "harvest" / episode_id
+
+    tracks_file = harvest_dir / "tracks.json"
+    clusters_file = harvest_dir / "clusters.json"
+    timeline_file = harvest_dir / "timeline.csv"
+
+    prepared = tracks_file.exists()
+    has_clusters = clusters_file.exists()
+    has_analytics = timeline_file.exists()
+
+    if not prepared:
+        return {
+            "prepared": False,
+            "has_clusters": False,
+            "has_analytics": False,
+            "missing_message": "Episode not prepared - no tracks found",
+            "next_action": "prepare",
+        }
+
+    if not has_clusters:
+        return {
+            "prepared": True,
+            "has_clusters": False,
+            "has_analytics": False,
+            "missing_message": "Tracks prepared but not clustered",
+            "next_action": "cluster",
+        }
+
+    if not has_analytics:
+        return {
+            "prepared": True,
+            "has_clusters": True,
+            "has_analytics": False,
+            "missing_message": "Clusters exist but analytics not generated",
+            "next_action": "analyze",
+        }
+
+    return {
+        "prepared": True,
+        "has_clusters": True,
+        "has_analytics": True,
+        "missing_message": "",
+        "next_action": "ready",
+    }
+
+
+def is_pipeline_running(episode_id: str, data_root: Union[Path, str] = Path("data")) -> bool:
+    """
+    Check if pipeline is currently running for an episode.
+
+    Returns:
+        True if pipeline_state.json exists and status is "running"
+    """
+    data_root = Path(data_root)
+    diagnostics_dir = data_root / "harvest" / episode_id / "diagnostics"
+    state_file = diagnostics_dir / "pipeline_state.json"
+
+    if not state_file.exists():
+        return False
+
+    try:
+        with open(state_file, "r") as f:
+            state = json.load(f)
+
+        status = state.get("status", "")
+        return status == "running"
+    except Exception:
+        return False
+
+
+def get_progress_bars_config(episode_id: str, data_root: Union[Path, str] = Path("data")) -> Dict[str, Any]:
+    """
+    Get progress bar configuration from pipeline_state.json.
+
+    Returns:
+        Dict with keys:
+        - active_stage: str - Current stage name
+        - stages: list - List of stage dicts with name, status, pct, message
+        - overall_pct: float - Overall progress (0.0 to 1.0)
+        - status: str - "running", "ok", "error", etc.
+    """
+    data_root = Path(data_root)
+    diagnostics_dir = data_root / "harvest" / episode_id / "diagnostics"
+    state_file = diagnostics_dir / "pipeline_state.json"
+
+    if not state_file.exists():
+        return {
+            "active_stage": "",
+            "stages": [],
+            "overall_pct": 0.0,
+            "status": "",
+        }
+
+    try:
+        with open(state_file, "r") as f:
+            state = json.load(f)
+    except Exception:
+        return {
+            "active_stage": "",
+            "stages": [],
+            "overall_pct": 0.0,
+            "status": "",
+        }
+
+    current_step = state.get("current_step", "")
+    step_index = state.get("step_index", 0)
+    total_steps = state.get("total_steps", 1)
+    status = state.get("status", "")
+    message = state.get("message", "")
+    pct = state.get("pct")
+
+    # Use stage names from state if provided (dynamic), otherwise use generic
+    # Orchestrator can write "stage_names": ["Detect/Embed", "Track", "Generate Face Stills"]
+    if "stage_names" in state:
+        stage_names = state["stage_names"]
+    else:
+        # Fallback: generate generic stage names based on total_steps
+        stage_names = [f"Stage {i}" for i in range(1, total_steps + 1)]
+        # Try to use current_step if it's meaningful
+        if current_step and step_index > 0 and step_index <= len(stage_names):
+            stage_names[step_index - 1] = current_step
+
+    stages = []
+    for idx in range(1, total_steps + 1):
+        stage_name = stage_names[idx - 1] if idx <= len(stage_names) else f"Stage {idx}"
+
+        if idx < step_index:
+            # Completed stages
+            stages.append({
+                "name": stage_name,
+                "status": "ok",
+                "pct": 1.0,
+                "message": "Complete",
+            })
+        elif idx == step_index:
+            # Current stage
+            stages.append({
+                "name": stage_name,
+                "status": status,
+                "pct": pct if pct is not None else 0.5,
+                "message": message,
+            })
+        else:
+            # Upcoming stages
+            stages.append({
+                "name": stage_name,
+                "status": "pending",
+                "pct": 0.0,
+                "message": "Pending",
+            })
+
+    # Calculate overall progress
+    if total_steps > 0 and step_index > 0:
+        base_pct = (step_index - 1) / max(total_steps, 1)
+        step_pct = (pct if pct is not None else 0.5) / max(total_steps, 1)
+        overall_pct = base_pct + step_pct
+    else:
+        overall_pct = 0.0
+
+    return {
+        "active_stage": current_step,
+        "stages": stages,
+        "overall_pct": overall_pct,
+        "status": status,
+    }
+
+
+def archive_pipeline_state(episode_id: str, data_root: Union[Path, str] = Path("data")) -> None:
+    """
+    Archive the current pipeline_state.json by renaming it with a timestamp.
+    """
+    from datetime import datetime
+
+    data_root = Path(data_root)
+    diagnostics_dir = data_root / "harvest" / episode_id / "diagnostics"
+    state_file = diagnostics_dir / "pipeline_state.json"
+
+    if state_file.exists():
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        archive_file = diagnostics_dir / f"pipeline_state_{timestamp}.json"
+        state_file.rename(archive_file)
+
+
+def read_pipeline_state(episode_id: str, data_root: Path | str = Path("data")) -> Dict[str, Any]:
+    """
+    Read the current pipeline state from pipeline_state.json.
+
+    Returns:
+        Dict with pipeline state, or empty dict if file doesn't exist
+    """
+    data_root = Path(data_root)
+    diagnostics_dir = data_root / "harvest" / episode_id / "diagnostics"
+    state_file = diagnostics_dir / "pipeline_state.json"
+
+    if not state_file.exists():
+        return {}
+
+    try:
+        with open(state_file, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}

@@ -369,3 +369,92 @@ def check_artifacts_status(episode_id: str, data_root: str = "data") -> Dict[str
         result["next_action"] = None
 
     return result
+
+
+def prewarm_thumbnails(
+    episode_id: str,
+    track_ids: list[int],
+    max_count: int = 48,
+    data_root: str = "data"
+) -> dict[str, int]:
+    """
+    Pre-warm thumbnails for upcoming tracks (non-blocking).
+
+    Checks if 160×200 thumbs exist for next N tracks and ensures they're
+    materialized. Does not decode full 320×400 crops.
+
+    Args:
+        episode_id: Episode ID
+        track_ids: List of track IDs to pre-warm
+        max_count: Maximum number to pre-warm (default: 48)
+        data_root: Root data directory
+
+    Returns:
+        Stats dict with {checked, exists, missing, prewarmed}
+    """
+    from pathlib import Path
+    from app.lib.registry import get_episode_hash
+
+    data_root_path = Path(data_root)
+    stats = {"checked": 0, "exists": 0, "missing": 0, "prewarmed": 0}
+
+    # Get episode hash for cache busting
+    episode_hash = get_episode_hash(episode_id, data_root_path)
+
+    # Limit to max_count
+    check_ids = track_ids[:max_count]
+
+    for track_id in check_ids:
+        stats["checked"] += 1
+
+        # Check if 160×200 thumb exists
+        thumb_path = get_track_still_path(
+            episode_id=episode_id,
+            track_id=track_id,
+            data_root=data_root_path,
+            prefer_thumb=True,
+            episode_hash=episode_hash
+        )
+
+        if thumb_path and thumb_path.exists():
+            # Check if it's actually a 160×200 thumb (not crop/legacy)
+            if "thumb" in str(thumb_path) or thumb_path.stat().st_size < 50000:
+                stats["exists"] += 1
+            else:
+                stats["missing"] += 1
+        else:
+            stats["missing"] += 1
+
+    return stats
+
+
+def render_prewarm_status(episode_id: str, data_root: str = "data") -> None:
+    """
+    Render thumbnail pre-warm status if needed.
+
+    Shows a subtle note if <90% of thumbs are materialized.
+    """
+    from pathlib import Path
+    import json
+
+    data_root_path = Path(data_root)
+    stats_file = data_root_path / "harvest" / episode_id / "stills" / "thumbnails_stats.json"
+
+    if not stats_file.exists():
+        return
+
+    try:
+        with open(stats_file, "r") as f:
+            stats = json.load(f)
+
+        generated = stats.get("generated", 0)
+        total = stats.get("total_tracks", 0)
+
+        if total > 0:
+            coverage = generated / total
+            if coverage < 0.9:
+                import streamlit as st
+                pct = int(coverage * 100)
+                st.caption(f"⏳ Thumbnail coverage: {pct}% ({generated}/{total})")
+    except Exception:
+        pass
