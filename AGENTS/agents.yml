@@ -1,0 +1,81 @@
+agents:
+  - name: harvest_agent
+    queue: harvest.q
+    inputs: [data/videos/<ep>.mp4, configs/pipeline.yaml]
+    outputs: [data/harvest/<ep>/manifest.parquet, data/harvest/<ep>/selected_samples.csv]
+    sla: "30min episode: ≤ 6–8 minutes sampling"
+    retries: 3
+    backoff: exponential
+
+  - name: detect_embed_agent
+    queue: inference.q
+    inputs: [data/harvest/<ep>/manifest.parquet]
+    outputs: [data/harvest/<ep>/embeddings.parquet, data/harvest/<ep>/det_stats.json]
+    sla: "≥90% frontal recall on test set"
+    retries: 3
+    backoff: exponential
+
+  - name: track_agent
+    queue: tracking.q
+    inputs: [data/harvest/<ep>/embeddings.parquet, configs/bytetrack.yaml]
+    outputs: [data/harvest/<ep>/tracks.json]
+    sla: "Track switch rate within configured cap"
+    retries: 3
+    backoff: exponential
+
+  - name: cluster_agent
+    queue: cluster.q
+    inputs: [data/harvest/<ep>/tracks.json, data/facebank]
+    outputs: [data/harvest/<ep>/clusters.json, data/harvest/<ep>/quality_report.json]
+    sla: "500 faces clustered in < 30 seconds"
+    retries: 3
+    backoff: exponential
+
+  - name: suggestions_agent
+    queue: assist.q
+    inputs: [data/facebank.parquet, data/harvest/<ep>/clusters.json]
+    outputs: [data/harvest/<ep>/assist/merge_suggestions.parquet, data/harvest/<ep>/assist/lowconf_queue.parquet]
+    sla: "≥15 plausible pairs per episode; 8–12s decision target"
+    retries: 3
+    backoff: jitter
+
+  - name: manual_add_helper
+    queue: assist.q
+    inputs: [data/harvest/<ep>/manifest.parquet, frame_path, bbox, cluster_id]
+    outputs: [data/harvest/<ep>/clusters.json, data/outputs/<ep>/timeline.csv]
+    sla: "≤2s round-trip feedback"
+    retries: 2
+    backoff: jitter
+
+  - name: analytics_export_agent
+    queue: analytics.q
+    inputs: [data/harvest/<ep>/clusters.json, data/harvest/<ep>/tracks.json]
+    outputs: [data/outputs/<ep>/totals.csv, data/outputs/<ep>/timeline.csv, data/outputs/<ep>/report.xlsx]
+    sla: "Export completed in ≤5 seconds"
+    retries: 3
+    backoff: linear
+
+  - name: retention_agent
+    queue: ops.q
+    inputs: [configs/pipeline.yaml, data/]
+    outputs: [retention_report.json]
+    sla: "Daily pass completes; zero orphan artifacts"
+    retries: 2
+    backoff: linear
+
+  - name: telemetry_agent
+    queue: ops.q
+    inputs: [job logs, metrics snapshots]
+    outputs: [metrics dashboard, alerts]
+    sla: "Metrics for every job; alert on SLA breach"
+    retries: 1
+    backoff: none
+
+  - name: overlay_agent
+    queue: viz.q
+    inputs: [data/harvest/<ep>/clusters.json, data/videos/<ep>.mp4]
+    outputs: [data/outputs/<ep>/overlay.json]
+    sla: "Segment-ready overlays in < 30 seconds"
+    retries: 3
+    backoff: exponential
+    phase: 2

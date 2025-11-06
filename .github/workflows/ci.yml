@@ -1,0 +1,20 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: python -m pip install --upgrade pip
+      - run: pip install -r requirements.txt black==24.4.2 isort==5.13.2 pyright==1.1.379
+      - run: black --check .
+      - run: isort --check-only .
+      - run: pyright
+      - name: Link check (docs)
+        uses: lycheeverse/lychee-action@v1
+        with:
+          args: --no-progress --max-redirects 5 --require-valid-ssl docs/**/*.md README.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

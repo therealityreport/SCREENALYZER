@@ -1,0 +1,22 @@
+enabled: true
+faiss:
+  type: FlatIP
+  normalize: true
+thresholds:
+  tau_join: 0.62
+  tau_stay: 0.57
+  tau_spawn: 0.48
+  min_margin: 0.10
+stability:
+  ema_window: 10
+  confirm_frames: 5
+  drop_frames: 8
+centroid:
+  ema_alpha: 0.015
+  max_sigma: 2.0
+io:
+  index_dir: data/indices
+  bank_dir: data/facebank
+logging:
+  write_events: true
+  path: logs/reid_events.jsonl

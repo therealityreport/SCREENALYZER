@@ -1,0 +1,41 @@
+============================================================
+============================================================
+✅ Video found (189.6 MB)
+✅ Job metadata initialized in Redis
+────────────────────────────────────────────────────────────
+Stage 1: Harvest
+────────────────────────────────────────────────────────────
+✅ Harvest complete in 5.8s
+   Frames sampled: 207
+   Manifest: data/harvest/RHOBH-TEST-10-28/manifest.parquet
+────────────────────────────────────────────────────────────
+Stage 2: Detection & Embeddings
+────────────────────────────────────────────────────────────
+✅ Detection complete in 60.2s
+   Faces detected: 248
+   Embeddings: data/harvest/RHOBH-TEST-10-28/embeddings.parquet
+────────────────────────────────────────────────────────────
+Stage 3: Tracking
+────────────────────────────────────────────────────────────
+✅ Tracking complete in 0.6s
+   Tracks built: 110
+   Tracks file: data/harvest/RHOBH-TEST-10-28/tracks.json
+────────────────────────────────────────────────────────────
+Stage 4: Clustering
+────────────────────────────────────────────────────────────
+✅ Clustering complete in 0.4s
+   Clusters: N/A
+   Merge suggestions: N/A
+   Low-conf clusters: N/A
+============================================================
+============================================================
+✅ Manifest: data/harvest/RHOBH-TEST-10-28/manifest.parquet (5.3 KB)
+✅ Embeddings: data/harvest/RHOBH-TEST-10-28/embeddings.parquet (862.1 KB)
+✅ Tracks: data/harvest/RHOBH-TEST-10-28/tracks.json (63.8 KB)
+✅ Clusters: data/harvest/RHOBH-TEST-10-28/clusters.json (2.7 KB)
+❌ Merge suggestions: data/harvest/RHOBH-TEST-10-28/assist/merge_suggestions.parquet 
+✅ Low-conf queue: data/harvest/RHOBH-TEST-10-28/assist/lowconf_queue.parquet (4.7 KB)
+✅ Det stats: data/harvest/RHOBH-TEST-10-28/diagnostics/reports/det_stats.json (0.7 KB)
+✅ Track stats: data/harvest/RHOBH-TEST-10-28/diagnostics/reports/track_stats.json (0.6 KB)
+✅ Cluster stats: data/harvest/RHOBH-TEST-10-28/diagnostics/reports/cluster_stats.json (0.2 KB)
+❌ Some artifacts missing!

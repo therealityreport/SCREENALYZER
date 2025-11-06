@@ -1,0 +1,653 @@
+"""
+Workspace - Unified face/cluster/track review with internal tabs.
+
+This page provides thumbnail-first review cards with real metrics from
+cluster_metrics and track_metrics.
+"""
+
+import json
+import sys
+from pathlib import Path
+
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+import streamlit as st
+
+from app.lib.mutator_api import configure_workspace_mutator
+from app.lib.pipeline import (
+    check_artifacts_status,
+    is_pipeline_running,
+    check_pipeline_can_run,
+    get_maintenance_reason,
+)
+from app.components.episode_manager_modal import episode_manager_modal
+from app.workspace.faces import render_faces_tab
+from app.workspace.clusters import render_clusters_tab
+from app.workspace.tracks import render_tracks_tab
+from app.workspace.review import render_review_tab
+from app.utils.ui_keys import safe_rerun
+from app.lib.registry import (
+    load_registry,
+    get_all_episodes,
+    recover_episodes_from_fs,
+    ensure_episode_in_registry
+)
+
+# Page config
+st.set_page_config(
+    page_title="Workspace",
+    page_icon="🗂️",
+    layout="wide",
+)
+
+# Constants
+DATA_ROOT = Path("data")
+
+
+def init_workspace_state():
+    """Initialize workspace session state."""
+    if "workspace_tab" not in st.session_state:
+        st.session_state.workspace_tab = "Clusters"
+    if "workspace_episode" not in st.session_state:
+        st.session_state.workspace_episode = None
+    if "workspace_selected_person" not in st.session_state:
+        st.session_state.workspace_selected_person = None
+    if "workspace_selected_cluster" not in st.session_state:
+        st.session_state.workspace_selected_cluster = None
+
+
+def main():
+    """Main workspace page."""
+    init_workspace_state()
+
+    # Inject 4:5 thumbnail CSS - FILL frame with cover (no letterboxing)
+    st.markdown("""
+    <style>
+    /* Force all thumbnails to FILL 4:5 frame */
+    .tile-45 {
+        width: 160px;
+        height: 200px;
+        overflow: hidden;
+        border-radius: 8px;
+        background: #f6f6f6;
+        display: inline-block;
+    }
+    .tile-45 img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover !important;
+        object-position: center !important;
+        display: block;
+    }
+    /* Apply to all st.image containers */
+    div[data-testid="stImage"] {
+        width: 160px !important;
+        height: 200px !important;
+        overflow: hidden !important;
+    }
+    div[data-testid="stImage"] img {
+        width: 100% !important;
+        height: 100% !important;
+        object-fit: cover !important;
+        object-position: center !important;
+        display: block !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.title("🗂️ Workspace")
+
+    # Load registry using canonical loader
+    reg = load_registry()
+    eps_in_registry = get_all_episodes(reg)
+    eps_on_disk = recover_episodes_from_fs()
+
+    # Recovery UI if registry is empty but episodes exist on disk
+    if not eps_in_registry and eps_on_disk:
+        st.warning("⚠️ No episodes in registry. Found harvests on disk.")
+        st.info("📁 Select an episode below to add it to the registry and continue.")
+
+        selected = st.selectbox(
+            "Recover episode",
+            options=eps_on_disk,
+            key="recover_ep_select"
+        )
+
+        col1, col2 = st.columns(2)
+        with col1:
+            show_id = st.text_input("Show ID", "rhobh", key="recover_show_id")
+        with col2:
+            season_id = st.text_input("Season ID", "s05", key="recover_season_id")
+
+        if st.button("Add to registry & continue", key="recover_ep_btn", type="primary") and selected:
+            ensure_episode_in_registry(selected, show_id, season_id)
+            st.stop()
+
+        st.stop()
+
+    elif not eps_in_registry and not eps_on_disk:
+        st.error("❌ No episodes found in registry or data/harvest.")
+        st.info("Please upload an episode first using the Upload page.")
+        st.stop()
+
+    # Episode selector (normal path)
+    # Extract just episode_ids from tuples
+    episode_ids = [ep_id for _, _, ep_id in eps_in_registry]
+
+    if not episode_ids:
+        st.warning("No episodes found in registry.")
+
+        # Show recovery option if harvest episodes exist
+        if eps_on_disk:
+            st.info("Found episodes in data/harvest. Use recovery option above.")
+        return
+
+    # Surface thumbnail generation summary if present
+    thumb_summary = st.session_state.pop("_thumb_summary", None)
+    if thumb_summary:
+        if thumb_summary.get("error_message"):
+            st.error(thumb_summary["error_message"])
+        else:
+            st.success(
+                f"Generated {thumb_summary['generated']} of {thumb_summary['total_tracks']} thumbnails"
+                f" (placeholders: {thumb_summary['placeholders']})."
+            )
+            if thumb_summary.get("errors"):
+                st.info(
+                    f"{thumb_summary['errors']} tracks could not be thumbnailed."
+                    " See thumbnails_stats.json for details."
+                )
+
+    # Header row: Pipeline buttons + Episode selector
+    header_cols = st.columns([1.2, 1, 1, 3])
+
+    # Import pipeline helpers
+
+    # Get current episode and check status
+    current_ep = st.session_state.get("episode_id", episode_ids[0] if episode_ids else None)
+    pipeline_running = is_pipeline_running(current_ep, DATA_ROOT) if current_ep else False
+    artifact_status = check_artifacts_status(current_ep, DATA_ROOT) if current_ep else {
+        "prepared": False,
+        "has_clusters": False
+    }
+
+
+    # Check if pipeline can run (maintenance mode gate)
+    pipeline_check = check_pipeline_can_run(current_ep, DATA_ROOT) if current_ep else {"can_run": True, "reason": ""}
+    can_run = pipeline_check.get("can_run", True)
+    block_reason = pipeline_check.get("reason", "")
+
+    with header_cols[0]:
+        prepare_help = "Run detect/embed → track → generate face stills"
+        if not can_run:
+            prepare_help = f"Blocked: {block_reason}"
+        
+        if st.button(
+            "🔄 Prepare Tracks & Stills",
+            type="primary",
+            help=prepare_help,
+            key="workspace_prepare_btn",
+            use_container_width=True,
+            disabled=not can_run,
+        ):
+            st.session_state["_trigger_prepare"] = True
+
+    with header_cols[1]:
+        cluster_disabled = not can_run or not artifact_status["prepared"]
+        cluster_help = "Cluster prepared tracks against current facebank"
+        if not can_run:
+            cluster_help = f"Blocked: {block_reason}"
+        elif not artifact_status["prepared"]:
+            cluster_help = "Requires preparation first"
+        
+        if st.button(
+            "🎯 Cluster",
+            help=cluster_help,
+            key="workspace_cluster_btn",
+            use_container_width=True,
+            disabled=cluster_disabled,
+        ):
+            st.session_state["_trigger_cluster"] = True
+
+    with header_cols[2]:
+        analyze_disabled = not can_run or not artifact_status["has_clusters"]
+        analyze_help = "Generate timeline & totals from clusters"
+        if not can_run:
+            analyze_help = f"Blocked: {block_reason}"
+        elif not artifact_status["has_clusters"]:
+            analyze_help = "Requires clustering first"
+        
+        if st.button(
+            "📊 Analyze",
+            help=analyze_help,
+            key="workspace_analyze_btn",
+            use_container_width=True,
+            disabled=analyze_disabled,
+        ):
+            st.session_state["_trigger_analyze"] = True
+
+
+    with header_cols[3]:
+        selected_episode = st.selectbox(
+            "Episode",
+            options=episode_ids,
+            index=episode_ids.index(st.session_state.workspace_episode)
+            if st.session_state.workspace_episode in episode_ids
+            else 0,
+            key="workspace_episode_selector",
+            label_visibility="collapsed"
+        )
+
+
+    # Manage Episode button - opens modal
+    if current_ep:
+        if st.button("🔧 Manage Episode", key="manage_episode_btn", use_container_width=False):
+            episode_manager_modal(current_ep, DATA_ROOT)
+
+    # Update session state if episode changed
+    if selected_episode != st.session_state.workspace_episode:
+        st.session_state.workspace_episode = selected_episode
+        st.session_state.episode_id = selected_episode  # For wkey()
+        st.session_state.workspace_selected_person = None
+        st.session_state.workspace_selected_cluster = None
+        safe_rerun()
+
+    # Store episode_id for wkey
+    st.session_state.episode_id = selected_episode
+
+    # Get show_id and season_id for the selected episode
+    show_id, season_id = None, None
+    for s_id, ss_id, ep_id in eps_in_registry:
+        if ep_id == selected_episode:
+            show_id, season_id = s_id, ss_id
+            break
+
+    # Progress polling UI
+    from app.workspace.common import read_pipeline_state
+    pipeline_state = read_pipeline_state(selected_episode, DATA_ROOT)
+
+    # Handle done state (show toast once)
+    if pipeline_state and pipeline_state.get("status") == "done":
+        done_key = f"_pipeline_done_{selected_episode}"
+        if done_key not in st.session_state:
+            # Show success toast with summary
+            extra = pipeline_state.get("extra", {})
+            result = extra.get("result", {}) if extra else {}
+
+            summary_parts = []
+            if "total_detections" in result:
+                summary_parts.append(f"{result['total_detections']} faces detected")
+            if "n_tracks" in result:
+                summary_parts.append(f"{result['n_tracks']} tracks")
+            if "n_clusters" in result:
+                summary_parts.append(f"{result['n_clusters']} clusters")
+            if "generated" in result:
+                summary_parts.append(f"{result['generated']} stills")
+
+            # Check for analytics totals
+            totals_by_identity = result.get("totals_by_identity", {})
+            if totals_by_identity:
+                identity_count = len([k for k in totals_by_identity.keys() if k != "Unknown"])
+                if identity_count > 0:
+                    summary_parts.append(f"{identity_count} identities tracked")
+
+            summary_msg = ", ".join(summary_parts) if summary_parts else "completed"
+            st.toast(f"✅ Pipeline complete: {summary_msg}", icon="✅")
+            st.session_state[done_key] = True
+
+            # Archive the state file to prevent re-showing
+            try:
+                from screentime.diagnostics.utils import archive_pipeline_state
+                archive_pipeline_state(selected_episode)
+            except Exception:
+                # Fallback: just mark as archived
+                state_file = DATA_ROOT / "harvest" / selected_episode / "diagnostics" / "pipeline_state.json"
+                if state_file.exists():
+                    with open(state_file, "r") as f:
+                        final_state = json.load(f)
+                    final_state["status"] = "archived"
+                    with open(state_file, "w") as f:
+                        json.dump(final_state, f, indent=2)
+
+    if pipeline_state and pipeline_state.get("status") not in (None, "done", "archived"):
+        st.markdown("---")
+
+        current_step = pipeline_state.get("current_step", "Unknown")
+        step_index = pipeline_state.get("step_index", 0)
+        total_steps = pipeline_state.get("total_steps", 4)
+        status = pipeline_state.get("status", "unknown")
+        message = pipeline_state.get("message", "")
+
+        if status == "error":
+            st.error(f"❌ Pipeline error: {message}")
+
+            with st.expander("Error details"):
+                st.json(pipeline_state)
+
+            # Check if error is in Stills stage
+            is_stills_error = "stills" in current_step.lower() or "generate" in current_step.lower()
+
+            if is_stills_error:
+                # Stills-specific retry options
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    if st.button("🔁 Resume Stills", key="resume_stills_btn", help="Continue from where it stalled"):
+                        with st.spinner("Resuming stills generation..."):
+                            try:
+                                from jobs.tasks.orchestrate import run_stills_only
+                                result = run_stills_only(selected_episode, data_root=DATA_ROOT, resume=True, force=False)
+                                if result.get("status") == "ok":
+                                    st.success("Stills generation resumed successfully!")
+                                    safe_rerun()
+                                else:
+                                    st.error(f"Resume failed: {result.get('error', 'Unknown error')}")
+                            except Exception as exc:
+                                st.error(f"Resume failed: {exc}")
+                with col2:
+                    if st.button("🔄 Force Re-run Stills", key="force_stills_btn", help="Regenerate all stills from scratch"):
+                        with st.spinner("Regenerating all stills..."):
+                            try:
+                                from jobs.tasks.orchestrate import run_stills_only
+                                result = run_stills_only(selected_episode, data_root=DATA_ROOT, resume=False, force=True)
+                                if result.get("status") == "ok":
+                                    st.success("Stills regenerated successfully!")
+                                    safe_rerun()
+                                else:
+                                    st.error(f"Regeneration failed: {result.get('error', 'Unknown error')}")
+                            except Exception as exc:
+                                st.error(f"Regeneration failed: {exc}")
+                with col3:
+                    if st.button("❌ Clear Error", key="clear_error_btn"):
+                        state_file = DATA_ROOT / "harvest" / selected_episode / "diagnostics" / "pipeline_state.json"
+                        if state_file.exists():
+                            state_file.unlink()
+                        safe_rerun()
+            else:
+                # General retry options
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("🔄 Retry Pipeline", key="retry_pipeline_btn"):
+                        st.session_state["_trigger_cluster"] = True
+                        safe_rerun()
+                with col2:
+                    if st.button("❌ Clear Error", key="clear_error_btn_gen"):
+                        state_file = DATA_ROOT / "harvest" / selected_episode / "diagnostics" / "pipeline_state.json"
+                        if state_file.exists():
+                            state_file.unlink()
+                        safe_rerun()
+        else:
+            # Running state
+            overall_pct = (step_index / total_steps) if total_steps > 0 else 0.0
+            st.info(f"🔄 {current_step} ({step_index}/{total_steps})")
+
+            if message:
+                st.caption(message)
+
+            # Per-stage progress bars
+            stages = ["Detect/Embed", "Track", "Cluster", "Generate Stills", "Analytics"]
+
+            for i, stage_name in enumerate(stages, start=1):
+                if i < step_index:
+                    # Completed
+                    st.progress(1.0, text=f"✅ {stage_name}")
+                elif i == step_index:
+                    # Current
+                    stage_pct = pipeline_state.get("pct", 0.5)
+                    if stage_pct is None:
+                        stage_pct = 0.5
+                    st.progress(float(stage_pct), text=f"⏳ {stage_name}")
+                else:
+                    # Pending
+                    st.progress(0.0, text=f"⏸️ {stage_name}")
+
+            # Auto-refresh every 2 seconds
+            if "last_refresh_ts" not in st.session_state:
+                st.session_state.last_refresh_ts = 0
+
+            import time
+            current_ts = time.time()
+            if current_ts - st.session_state.last_refresh_ts > 2:
+                st.session_state.last_refresh_ts = current_ts
+                st.rerun()
+
+        st.markdown("---")
+
+    # Handle Prepare button click
+    if st.session_state.pop("_trigger_prepare", False):
+        st.info("🔄 **Starting Prepare pipeline...**")
+        st.write("Running Detect/Embed → Track → Generate Face Stills")
+
+        # Mark pipeline as starting
+        from app.workspace.common import read_pipeline_state
+        diagnostics_dir = DATA_ROOT / "harvest" / selected_episode / "diagnostics"
+        diagnostics_dir.mkdir(parents=True, exist_ok=True)
+
+        state_file = diagnostics_dir / "pipeline_state.json"
+        with open(state_file, "w") as f:
+            json.dump({
+                "episode": selected_episode,
+                "current_step": "Starting",
+                "step_index": 0,
+                "total_steps": 4,
+                "status": "running",
+                "message": "Initializing Prepare pipeline...",
+            }, f, indent=2)
+
+        try:
+            from jobs.tasks.orchestrate import orchestrate_prepare
+
+            with st.spinner("Running Prepare pipeline... This may take several minutes."):
+                result = orchestrate_prepare(
+                    episode_id=selected_episode,
+                    data_root=DATA_ROOT,
+                    force=False,  # Skip stages that already have artifacts
+                    resume=True,  # Resume from last stage
+                )
+
+            if result.get("status") == "ok":
+                st.success(f"✅ Prepare complete for {selected_episode}!")
+                st.info("💡 **Next steps:**\n1. Curate facebank on CAST page\n2. Click **Cluster** button")
+                safe_rerun()
+            else:
+                st.error(f"❌ Prepare failed: {result.get('error', 'Unknown error')}")
+                with st.expander("Error details"):
+                    st.json(result)
+
+        except Exception as e:
+            st.error(f"❌ Prepare failed: {str(e)}")
+            import traceback
+            with st.expander("Error details"):
+                st.code(traceback.format_exc())
+
+    # Handle Cluster button click
+    if st.session_state.pop("_trigger_cluster", False):
+        st.info("🎯 **Starting Cluster pipeline...**")
+        st.write("Clustering prepared tracks against current facebank")
+
+        # Mark pipeline as starting
+        diagnostics_dir = DATA_ROOT / "harvest" / selected_episode / "diagnostics"
+        diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        state_file = diagnostics_dir / "pipeline_state.json"
+
+        with open(state_file, "w") as f:
+            json.dump({
+                "episode": selected_episode,
+                "current_step": "Cluster",
+                "step_index": 1,
+                "total_steps": 1,
+                "status": "running",
+                "message": "Clustering tracks...",
+            }, f, indent=2)
+
+        try:
+            from jobs.tasks.orchestrate import orchestrate_cluster_only
+
+            with st.spinner("Clustering... This may take a few minutes."):
+                result = orchestrate_cluster_only(
+                    episode_id=selected_episode,
+                    data_root=DATA_ROOT,
+                )
+
+            if result.get("status") == "ok":
+                n_clusters = result.get("result", {}).get("n_clusters", 0)
+                st.success(f"✅ Clustered into {n_clusters} clusters!")
+                st.info("💡 **Next step:** Click **Analyze** to generate timeline & totals")
+                safe_rerun()
+            else:
+                st.error(f"❌ Cluster failed: {result.get('error', 'Unknown error')}")
+                with st.expander("Error details"):
+                    st.json(result)
+
+        except Exception as e:
+            st.error(f"❌ Cluster failed: {str(e)}")
+            import traceback
+            with st.expander("Error details"):
+                st.code(traceback.format_exc())
+
+    # Handle Analyze button click
+    if st.session_state.pop("_trigger_analyze", False):
+        st.info("📊 **Starting Analytics pipeline...**")
+        st.write("Generating timeline & totals from final cluster labels")
+
+        # Mark pipeline as starting
+        diagnostics_dir = DATA_ROOT / "harvest" / selected_episode / "diagnostics"
+        diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        state_file = diagnostics_dir / "pipeline_state.json"
+
+        with open(state_file, "w") as f:
+            json.dump({
+                "episode": selected_episode,
+                "current_step": "Analytics",
+                "step_index": 1,
+                "total_steps": 1,
+                "status": "running",
+                "message": "Generating analytics...",
+            }, f, indent=2)
+
+        try:
+            from jobs.tasks.orchestrate import orchestrate_analytics_only
+
+            with st.spinner("Generating analytics..."):
+                result = orchestrate_analytics_only(
+                    episode_id=selected_episode,
+                    data_root=DATA_ROOT,
+                )
+
+            if result.get("status") == "ok":
+                intervals = result.get("result", {}).get("intervals_created", 0)
+                st.success(f"✅ Analytics complete! Generated {intervals} timeline intervals")
+                st.info("💡 Check the **Review** tab to see timeline & totals")
+                safe_rerun()
+            else:
+                st.error(f"❌ Analytics failed: {result.get('error', 'Unknown error')}")
+                with st.expander("Error details"):
+                    st.json(result)
+
+        except Exception as e:
+            st.error(f"❌ Analytics failed: {str(e)}")
+            import traceback
+            with st.expander("Error details"):
+                st.code(traceback.format_exc())
+
+    # Keep old cluster handler as fallback (for Enhance button compatibility)
+    if st.session_state.pop("_trigger_cluster_full", False):
+        st.info("🔄 Starting full pipeline: Detect/Embed → Track → Cluster → Generate Stills...")
+
+    # Handle Enhance Clusters button click
+    if st.session_state.pop("_trigger_enhance", False):
+        st.info("✨ Starting enhance clusters: re-cluster with constraints + densify + analytics...")
+
+        try:
+            from jobs.tasks.recluster import recluster_task
+            from jobs.tasks.densify_two_pass import densify_two_pass
+            from jobs.tasks.analytics import analytics_task
+            from app.lib.data import load_clusters
+            import yaml
+
+            # Load config to check if densify is enabled
+            config_path = Path("configs/pipeline.yaml")
+            config = {}
+            if config_path.exists():
+                with open(config_path) as f:
+                    config = yaml.safe_load(f) or {}
+
+            clustering_config = config.get('clustering', {})
+            use_densify = clustering_config.get('use_densify_two_pass', False)
+
+            with st.spinner("Step 1: Re-clustering with manual constraints..."):
+                recluster_result = recluster_task(
+                    "manual",
+                    selected_episode,
+                    show_id=show_id,
+                    season_id=season_id,
+                    sources=None,
+                    use_constraints=True  # Always use constraints for enhance
+                )
+                st.toast(f"✅ Re-clustered into {recluster_result.get('n_clusters', 0)} clusters")
+
+            # Optional densify step
+            if use_densify:
+                with st.spinner("Step 2: Densifying clusters (two-pass)..."):
+                    densify_result = densify_two_pass("manual", selected_episode)
+                    st.toast(f"✅ Densified {densify_result.get('tracks_promoted', 0)} tracks")
+
+            with st.spinner(f"Step {3 if use_densify else 2}: Regenerating analytics..."):
+                clusters_data = load_clusters(selected_episode, DATA_ROOT)
+                cluster_assignments = {}
+                if clusters_data:
+                    for cluster in clusters_data.get("clusters", []):
+                        if "name" in cluster:
+                            cluster_assignments[cluster["cluster_id"]] = cluster["name"]
+
+                analytics_result = analytics_task("manual", selected_episode, cluster_assignments)
+                st.toast(f"✅ Generated {analytics_result['stats']['intervals_created']} intervals")
+
+            st.success(f"✅ Enhance clusters complete for {selected_episode}!")
+            st.info("💡 Analytics are now fresh. Metrics have been recomputed with current constraints.")
+            safe_rerun()
+
+        except Exception as e:
+            st.error(f"❌ Enhance clusters failed: {str(e)}")
+            import traceback
+            with st.expander("Error details"):
+                st.code(traceback.format_exc())
+
+    # Configure mutator
+    mutator = configure_workspace_mutator(selected_episode, DATA_ROOT)
+
+    if mutator is None:
+        st.error(f"No cluster data found for {selected_episode}. Run clustering first.")
+        return
+
+    st.markdown("---")
+
+    # Render tabs internally using radio
+    tab = st.radio(
+        "Workspace",
+        ["Faces", "Clusters", "Tracks", "Review"],
+        horizontal=True,
+        label_visibility="collapsed",
+        index=["Faces", "Clusters", "Tracks", "Review"].index(
+            st.session_state.workspace_tab
+        ),
+        key="workspace_tab_radio",
+    )
+
+    # Update session state if tab changed
+    if tab != st.session_state.workspace_tab:
+        st.session_state.workspace_tab = tab
+
+    # Render selected tab
+    if tab == "Faces":
+        render_faces_tab(mutator)
+    elif tab == "Clusters":
+        render_clusters_tab(mutator)
+    elif tab == "Tracks":
+        render_tracks_tab(mutator)
+    else:  # Review
+        render_review_tab(mutator)
+
+
+if __name__ == "__main__":
+    main()

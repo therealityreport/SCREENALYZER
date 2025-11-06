@@ -1,0 +1,54 @@
+video:
+  sampling_stride_ms: 100    # 10 fps baseline for stability
+bootstrap:
+  enabled: true
+  baseline_harvest_dir: "data/harvest/RHOBH-TEST-10-28_baseline"
+timeline:
+  edge_epsilon_ms: 150
+per_identity:
+  KIM:   { freeze: true }
+  KYLE:  { freeze: true }
+  LVP:   { freeze: true }
+  EILEEN:{
+    reid_min_sim: 0.85,
+    reid_min_margin: 0.10,
+    gap_merge_ms_lo_conf: 500,
+    gap_merge_ms_hi_conf: 1200,
+    gap_merge_ms_max: 2000,
+    min_interval_frames: 6,
+    min_visible_frac: 0.60,
+    visible_conf_threshold: 0.72
+  }
+  BRANDI:{
+    reid_min_sim: 0.84,
+    reid_min_margin: 0.10,
+    gap_merge_ms_max: 2300,
+    edge_epsilon_ms: 200
+  }
+  RINNA: {
+    reid_min_sim: 0.83,
+    reid_min_margin: 0.08,
+    gap_merge_ms_max: 2400,
+    edge_epsilon_ms: 190
+  }
+  YOLANDA:{
+    reid_min_sim: 0.82,
+    reid_min_margin: 0.08,
+    gap_merge_ms_max: 2600
+  }
+local_densify:
+  enabled: true
+  pad_ms: 800
+  max_gap_ms: 10000
+  min_coverage_ratio: 0.2
+  detect:
+    min_confidence: 0.55
+    min_face_px: 45
+    scales: [1.0, 1.3, 1.6, 2.0]
+    use_person_roi: false
+  track:
+    min_consecutive: 4
+  verify:
+    min_sim: 0.82
+    min_margin: 0.08
+    require_margin: true

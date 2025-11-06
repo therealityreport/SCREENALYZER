@@ -1,0 +1,256 @@
+"""Thumbnail helpers for workspace views."""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+from pathlib import Path
+from typing import Dict, Optional
+
+from PIL import Image, ImageOps
+
+logger = logging.getLogger(__name__)
+
+DATA_ROOT = Path(os.environ.get("SCREENALYZER_DATA_ROOT", "data"))
+THUMB_SIZE = (160, 200)
+THUMB_QUALITY = 92
+INDEX_FILENAME = "ui_thumb_index.json"
+THUMB_STATS_FILENAME = "thumbnails_stats.json"
+
+PLACEHOLDER_DATA_URI = (
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAJYAAADICAIAAACF548yAAAB5UlEQVR4nO3RMQ0AIQDAQHhDbKz4d/UiGEiTOwVNOtc+g7LvdQC3LMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzMM/CPAvzLMyzcNT9eYoCNCvOwuYAAAAASUVORK5CYII="
+)
+
+_INDEX_CACHE: Dict[str, tuple[float, dict]] = {}
+_STILLS_MANIFEST_CACHE: Dict[str, tuple[str, dict]] = {}  # keyed by episode_id:episode_hash
+
+
+def center_crop_fill(image: Image.Image, size: tuple[int, int] = THUMB_SIZE) -> Image.Image:
+    """Center-crop image to requested size while preserving aspect."""
+    return ImageOps.fit(image, size, Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+
+
+def ensure_placeholder_thumbnail(path: Path) -> None:
+    """Write a neutral placeholder so the UI never renders a blank tile."""
+    placeholder = Image.new("RGB", THUMB_SIZE, color=(24, 28, 36))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    placeholder.save(path, quality=THUMB_QUALITY)
+
+
+def track_thumb(episode_id: str, track_id: int):
+    """
+    Return the cached thumbnail path for a track or a placeholder data URI.
+    """
+    indexed = get_thumb_from_index(episode_id, track_id)
+    if indexed and indexed.exists() and indexed.stat().st_size > 0:
+        return indexed
+
+    output_path = thumbnail_path(episode_id, track_id)
+    if output_path.exists() and output_path.stat().st_size > 0:
+        record_thumb_path(episode_id, track_id, output_path)
+        return output_path
+
+    return PLACEHOLDER_DATA_URI
+
+
+def record_thumb_path(episode_id: str, track_id: int, path: Path) -> None:
+    """Persist thumbnail path in UI index for reuse."""
+    try:
+        relative = path.relative_to(DATA_ROOT / "harvest" / episode_id).as_posix()
+    except ValueError:
+        relative = path.as_posix()
+
+    index = _load_thumb_index(episode_id)
+    tracks = index.setdefault("tracks", {})
+    if str(track_id) not in tracks or tracks[str(track_id)] != relative:
+        tracks[str(track_id)] = relative
+        _save_thumb_index(episode_id, index)
+
+
+def get_thumb_from_index(episode_id: str, track_id: int) -> Optional[Path]:
+    """Return thumbnail path for track from index if present."""
+    index = _load_thumb_index(episode_id)
+    tracks = index.get("tracks", {})
+    rel_path = tracks.get(str(track_id))
+    if not rel_path:
+        return None
+    abs_path = DATA_ROOT / "harvest" / episode_id / rel_path
+    if abs_path.exists():
+        return abs_path
+    return None
+
+
+def thumbnail_path(episode_id: str, track_id: int) -> Path:
+    return DATA_ROOT / "harvest" / episode_id / "thumbnails" / "tracks" / f"{track_id}.jpg"
+
+
+def load_thumbnail_stats(episode_id: str) -> Optional[dict]:
+    stats_path = DATA_ROOT / "harvest" / episode_id / "thumbnails" / THUMB_STATS_FILENAME
+    if not stats_path.exists():
+        return None
+    try:
+        with open(stats_path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception as exc:
+        logger.warning("Failed to read thumbnail stats %s: %s", stats_path, exc)
+        return None
+
+
+def thumbnail_coverage(episode_id: str) -> tuple[int, int, int]:
+    stats = load_thumbnail_stats(episode_id)
+    if stats:
+        generated = int(stats.get("generated", 0) or 0)
+        placeholders = int(stats.get("placeholders", 0) or 0)
+        total = int(stats.get("total_tracks", generated + placeholders))
+        return generated, total, placeholders
+
+    thumb_dir = DATA_ROOT / "harvest" / episode_id / "thumbnails" / "tracks"
+    if not thumb_dir.exists():
+        return 0, 0, 0
+
+    generated = sum(1 for _ in thumb_dir.glob("*.jpg"))
+    return generated, generated, 0
+
+
+def _index_path(episode_id: str) -> Path:
+    return DATA_ROOT / "harvest" / episode_id / "diagnostics" / INDEX_FILENAME
+
+
+def _load_thumb_index(episode_id: str) -> dict:
+    """Load cached thumbnail index for episode."""
+    cache_key = episode_id
+    path = _index_path(episode_id)
+    if path.exists():
+        mtime = path.stat().st_mtime
+    else:
+        mtime = 0.0
+
+    cached = _INDEX_CACHE.get(cache_key)
+    if cached and cached[0] == episode_hash:
+        return cached[1]
+
+    if not path.exists():
+        index = {"tracks": {}}
+    else:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                index = json.load(fh)
+        except Exception as exc:
+            logger.warning("Failed to load thumbnail index %s: %s", path, exc)
+            index = {"tracks": {}}
+
+    _INDEX_CACHE[cache_key] = (mtime, index)
+    return index
+
+
+def _save_thumb_index(episode_id: str, index: dict) -> None:
+    """Persist thumbnail index to disk and cache."""
+    path = _index_path(episode_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(index, fh, indent=2)
+    except Exception as exc:
+        logger.warning("Failed to save thumbnail index %s: %s", path, exc)
+        return
+
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    _INDEX_CACHE[episode_id] = (mtime, index)
+
+
+def _load_stills_manifest(episode_id: str, episode_hash: str | None = None) -> dict:
+    """
+    Load stills manifest with hash-based caching.
+    
+    Cache key includes episode_id and episode_hash to guarantee freshness
+    after Move/Restore/Rehash operations.
+    """
+    # Get episode_hash if not provided
+    if episode_hash is None:
+        from app.workspace.common import get_episode_hash
+        episode_hash = get_episode_hash(episode_id, DATA_ROOT) or "none"
+    
+    cache_key = f"{episode_id}:{episode_hash}"
+    manifest_path = DATA_ROOT / "harvest" / episode_id / "stills" / "track_stills.jsonl"
+    
+    if not manifest_path.exists():
+        return {}
+    
+# Check cache
+    cached = _STILLS_MANIFEST_CACHE.get(cache_key)
+    if cached and cached[0] == episode_hash:
+        return cached[1]
+    
+    # Load JSONL manifest
+    manifest = {}
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    track_id = entry.get("track_id")
+                    if track_id is not None:
+                        manifest[str(track_id)] = entry
+                except json.JSONDecodeError as exc:
+                    logger.warning("Skipping invalid JSONL line in %s: %s", manifest_path, exc)
+                    continue
+    except Exception as exc:
+        logger.warning("Failed to load stills manifest %s: %s", manifest_path, exc)
+        return {}
+    
+    # Cache it
+    _STILLS_MANIFEST_CACHE[cache_key] = (episode_hash, manifest)
+    return manifest
+
+
+def get_track_still_path(episode_id: str, track_id: int, episode_hash: Optional[str] = None):
+    """
+    Get the path to a track's representative still image.
+
+    Checks in order:
+    1. Stills manifest thumb_path (160×200 thumbnails)
+    2. Stills manifest crop_path (320×400 face-aware crops with FIQA scoring)
+    3. Old thumbnail path (ffmpeg-generated full frames)
+    4. Placeholder data URI
+
+    Args:
+        episode_id: Episode identifier
+        track_id: Track identifier
+        episode_hash: Optional episode hash for cache busting. If not provided, fetched from registry.
+
+    Returns:
+        Path to still image or placeholder data URI
+    """
+    # Check stills manifest first
+    manifest = _load_stills_manifest(episode_id, episode_hash)
+    entry = manifest.get(str(track_id))
+    if entry:
+        # Prefer 160×200 thumbnail if available
+        thumb_path = entry.get("thumb_path")
+        if thumb_path:
+            full_path = DATA_ROOT / "harvest" / episode_id / thumb_path
+            if full_path.exists() and full_path.stat().st_size > 0:
+                return full_path
+
+        # Fallback to 320×400 crop
+        crop_path = entry.get("crop_path")
+        if crop_path:
+            # crop_path is relative to data/harvest/{episode_id}/
+            full_path = DATA_ROOT / "harvest" / episode_id / crop_path
+            if full_path.exists() and full_path.stat().st_size > 0:
+                return full_path
+    
+    # Fallback to old thumbnail path
+    old_thumb = thumbnail_path(episode_id, track_id)
+    if old_thumb.exists() and old_thumb.stat().st_size > 0:
+        return old_thumb
+    
+    # Final fallback: placeholder
+    return PLACEHOLDER_DATA_URI

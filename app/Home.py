@@ -1,0 +1,57 @@
+"""
+Home - Main dashboard and navigation.
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+import streamlit as st
+
+st.set_page_config(
+    page_title="Screenalyzer",
+    page_icon="🎬",
+    layout="wide",
+)
+
+st.title("🎬 Screenalyzer")
+st.markdown("### Face recognition and tracking for TV shows")
+
+st.markdown("---")
+
+st.markdown("""
+## Quick Start
+
+1. **📤 Upload** - Upload episodes and cast images
+2. **🎭 CAST** - Manage cast member reference images
+3. **🗂️ Workspace** - Review and edit face clusters
+4. **📊 Analytics** - View metrics and insights
+5. **⚙️ Settings** - Configure application settings
+
+## Navigation
+
+Use the sidebar to navigate between pages. The **Workspace** page provides a unified
+interface for reviewing faces, clusters, and tracks with internal tabs.
+
+## Features
+
+- **Thumbnail-first review** - See faces before making decisions
+- **Real-time metrics** - Confidence scores and contamination rates
+- **Low-confidence queues** - Focus on items that need review
+- **Manual constraints** - Lock assignments and guide re-clustering
+- **Analytics freshness** - Track when data was last updated
+""")
+
+# Show registry info
+from screentime.models import get_registry
+
+registry = get_registry()
+shows = getattr(registry, "shows", [])
+
+if shows:
+    st.markdown("---")
+    st.markdown("### Available Shows")
+    for show in shows:
+        seasons = getattr(show, "seasons", [])
+        st.markdown(f"**{show.show_id}** - {len(seasons)} season(s)")

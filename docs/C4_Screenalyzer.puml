@@ -1,0 +1,54 @@
+@startuml C4_Screenalyzer
+title C4 - Context & Containers - Screenalyzer
+
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam ArrowColor #555
+skinparam RectangleBorderColor #333
+skinparam RectangleFontColor #111
+
+' Actors
+actor Admin as A
+actor Analyst as AN
+
+' System boundary
+rectangle "Screenalyzer System" as SYS {
+  component "Streamlit UI\n(app/*)" as UI
+  component "API Service\n(api/*)" as API
+  component "Redis Queue\n(jobs, ETA, status)" as REDIS
+  component "Worker Pool\n(jobs/*)" as WORK
+  component "Parquet Facebank\n(embeddings/clusters)" as FB
+  component "Meta DB\n(SQLite/Postgres)\n(audit, RBAC, jobs)" as DB
+  component "Data Storage\n(data/*, optional S3/GCS)" as DATA
+}
+
+A --> UI : Upload episodes,\nReview & Edit,\nExports
+AN --> UI : Read-only analytics,\nExports
+UI --> API : HTTP (auth, uploads,\njobs, analytics)
+API --> REDIS : Enqueue jobs,\nstatus/ETA
+WORK --> REDIS : Progress,\ncheckpoints
+WORK --> FB : Read/Write embeddings,\nclusters (Parquet)
+WORK --> DB : Audit, jobs,\nusers/roles
+WORK --> DATA : Read/Write\n(manifest, outputs)
+API --> DB : Auth/RBAC
+
+' Component-level view inside Worker Pool
+rectangle "Worker Tasks" as WT {
+  component "harvest.py\n(scene/sample)" as HAR
+  component "detect_embed.py\n(RetinaFace + ArcFace)" as DET
+  component "track.py\n(ByteTrack)" as TRK
+  component "cluster.py\n(DBSCAN + quality)" as CLS
+  component "suggestions.py\n(centroid/ANN)" as SUG
+  component "analytics.py\n(interval-merge, exports)" as ANA
+}
+
+REDIS --> HAR : job
+HAR --> DET : frames/manifest
+DET --> TRK : detections+embeddings
+TRK --> CLS : tracklets
+CLS --> SUG : clusters
+SUG --> UI : merge queue (via API)
+CLS --> ANA : clusters
+ANA --> DATA : totals.csv,\ntimeline.csv,\n.xlsx
+
+@enduml

@@ -1,0 +1,8 @@
+component,spec,impl,test,abs_error_s,threshold_s,status,notes
+KIM,✓,✓,✓,0.7,4.5,PASS,Frozen baseline
+KYLE,✓,✓,✓,2.0,4.5,PASS,Frozen baseline
+LVP,✓,✓,✓,0.4,4.5,PASS,Frozen baseline
+EILEEN,✓,✓,✓,3.7,4.5,PASS,Timeline hardening successful
+RINNA,✓,✓,✓,4.2,4.5,PASS,Within spec at ≤4.5s threshold
+BRANDI,✓,✓,✓,4.2,4.5,PASS,Within spec at ≤4.5s threshold
+YOLANDA,✓,✓,✓*,7.3,4.5,OFF-SCREEN PROVEN,Exhaustive proof: 0 faces in 117 full-gap windows + 144 boundary faces. See yolanda_fullgap_scan.json

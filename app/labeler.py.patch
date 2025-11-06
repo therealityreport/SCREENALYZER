@@ -1,0 +1,20 @@
+--- a/app/labeler.py
++++ b/app/labeler.py
+@@ -17,6 +17,7 @@
+ from screentime.types import UploadStatus
+ from screentime.utils import get_video_path, normalize_episode_id
+ from screentime.viz.thumbnails import ThumbnailGenerator
++from app.pairwise_review_redesign import render_pairwise_review_v2
+ 
+ load_dotenv()
+ 
+@@ -918,7 +919,7 @@
+     if st.session_state.review_mode == "all_faces":
+         render_all_faces_grid(clusters_data, selected_episode, state_mgr, cluster_mutator)
+     elif st.session_state.review_mode == "pairwise":
+-        render_pairwise_review(
+-            clusters_data, suggestions_df, selected_episode, state_mgr, cluster_mutator
++        render_pairwise_review_v2(
++            clusters_data, suggestions_df, selected_episode, state_mgr, cluster_mutator, DATA_ROOT
+         )
+     elif st.session_state.review_mode == "lowconf":

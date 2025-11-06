@@ -1,0 +1,117 @@
+# Track stills generation configuration
+# Face-aware crops with FIQA scoring and Re-ID disambiguation
+
+# Output image dimensions (width, height)
+tile_size: [320, 400]
+
+# Face crop margin (fraction of bbox size to expand on each side)
+margin: 0.30
+
+# Number of candidate frames to sample per track
+samples_per_track: 7
+
+# Time window for searching alternative frames (seconds)
+time_window_s: 0.5
+
+# Time step for fallback frame search (seconds)
+time_step_s: 0.16
+
+# Quality thresholds and scoring
+quality:
+  # Minimum FIQA score (0-1, SER-FIQ or MagFace)
+  fiqa_min: 0.60  # Lowered from 0.60 - will tune after seeing distribution
+
+  # Minimum sharpness (Laplacian variance)
+  sharp_min: 15.0  # Lowered from 25.0
+
+  # Minimum face height in pixels
+  min_face_height: 60
+
+  # Composite score weights (must sum to 1.0)
+  weights:
+    fiqa: 0.50
+    sharpness: 0.30
+    face_height: 0.20
+
+  # FIQA model selection: "embedding_norm" (MagFace-style) or "serfiq" (full stochastic)
+  fiqa_method: "serfiq"
+
+# Optional face restoration
+restore:
+  # Enable CodeFormer restoration
+  enable: false
+
+  # CodeFormer fidelity weight (0.0-1.0, higher = more faithful to original)
+  codeformer_w: 0.7
+
+  # Identity guard: reject if cosine(original_embed, restored_embed) < threshold
+  identity_threshold: 0.98
+
+# Re-ID disambiguation
+reid:
+  # Enable FAISS lookup for multi-face frames
+  enable: true
+
+  # Minimum cosine similarity to track centroid to accept face
+  min_similarity: 0.75
+
+  # EMA alpha for updating track centroid after confirmed crop
+  centroid_ema_alpha: 0.01
+
+# Black frame detection
+black_frame:
+  # Minimum mean brightness (0-255)
+  min_mean: 4.0
+
+  # Minimum variance
+  min_variance: 8.0
+
+# Output paths (relative to data root)
+io:
+  # Base directory for stills (relative to data_root)
+  out_dir: "harvest/{episode_id}/stills"
+
+  # Subdirectory for track crops
+  tracks_subdir: "tracks"
+
+  # Subdirectory for context images (optional full-frame with bbox overlay)
+  context_subdir: "tracks_context"
+
+  # Manifest file (JSONL format, relative to data_root)
+  manifest: "harvest/{episode_id}/stills/track_stills.jsonl"
+
+  # JPEG quality for saved crops
+  jpeg_quality: 90
+
+# Context image overlays (optional full-frame with face box)
+overlays:
+  # Write context images alongside crops
+  write_context: true
+
+  # Draw bounding box on context image
+  draw_box: true
+
+  # Box color (RGB)
+  box_color: [255, 0, 0]
+
+  # Box line width
+  box_width: 3
+
+# Telemetry
+telemetry:
+  # Event log path
+  events_log: "logs/stills_events.jsonl"
+
+  # Enable detailed logging
+  verbose: true
+
+# Fallback behavior
+fallback:
+  # Maximum number of alternative frames to try before giving up
+  max_attempts: 5
+
+  # Use person bbox if face bbox unavailable
+  use_person_bbox: true
+
+  # Write diagnostic context image when falling back
+  write_diagnostic: true

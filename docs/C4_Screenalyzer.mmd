@@ -1,0 +1,51 @@
+```mermaid
+flowchart TB
+  %% C4 - Context & Containers (Mermaid approximation)
+
+  subgraph Ext[External Actors]
+    A[Admin]:::actor
+    AN[Analyst]:::actor
+  end
+
+  subgraph SYS[Screenalyzer System]
+    subgraph UI[Streamlit UI (app/*)]
+    end
+    subgraph API[API Service (api/*)]
+    end
+    REDIS[(Redis Queue\njobs, ETA, status)]:::queue
+    subgraph WORK[Worker Pool (jobs/*)]
+      HAR[harvest.py\nscene/sample]
+      DET[detect_embed.py\nRetinaFace+ArcFace]
+      TRK[track.py\nByteTrack]
+      CLS[cluster.py\nDBSCAN+quality]
+      SUG[suggestions.py\ncentroid/ANN]
+      ANA[analytics.py\ninterval-merge/exports]
+    end
+    FB[(Parquet Facebank\nembeddings/clusters)]:::storage
+    DB[(Meta DB\nSQLite/Postgres)]:::storage
+    DATA[(Data Storage\ndata/*, S3/GCS opt.)]:::storage
+  end
+
+  A --> UI
+  AN --> UI
+  UI --> API
+  API --> REDIS
+  WORK --> REDIS
+  WORK --> FB
+  WORK --> DB
+  WORK --> DATA
+  API --> DB
+
+  REDIS --> HAR
+  HAR --> DET
+  DET --> TRK
+  TRK --> CLS
+  CLS --> SUG
+  SUG --> API
+  CLS --> ANA
+  ANA --> DATA
+
+  classDef actor fill:#f3f7ff,stroke:#6b8df2,color:#111;
+  classDef queue fill:#fff9e6,stroke:#e9b949,color:#111;
+  classDef storage fill:#eefaf1,stroke:#2eb872,color:#111;
+```
