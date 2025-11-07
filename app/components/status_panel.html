@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <style>
+        :root { color-scheme: light dark; }
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: transparent;
+        }
+        .status-panel {
+            border-radius: 10px;
+            border: 1px solid rgba(0,0,0,0.08);
+            padding: 16px;
+            background: rgba(255,255,255,0.7);
+            backdrop-filter: blur(8px);
+        }
+        @media (prefers-color-scheme: dark) {
+            .status-panel {
+                background: rgba(18,18,28,0.65);
+                border-color: rgba(255,255,255,0.08);
+            }
+        }
+        .status-header {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: space-between;
+            gap: 8px;
+            margin-bottom: 8px;
+            font-size: 0.95rem;
+        }
+        .status-header strong {
+            font-size: 1rem;
+        }
+        .status-progress {
+            position: relative;
+            width: 100%;
+            height: 16px;
+            border-radius: 999px;
+            background: rgba(0,0,0,0.08);
+            overflow: hidden;
+        }
+        @media (prefers-color-scheme: dark) {
+            .status-progress {
+                background: rgba(255,255,255,0.12);
+            }
+        }
+        .status-progress-bar {
+            position: absolute;
+            left: 0;
+            top: 0;
+            bottom: 0;
+            width: 0%;
+            border-radius: 999px;
+            background: linear-gradient(90deg, #00c6ff, #0072ff);
+            transition: width 0.4s ease;
+        }
+        .status-progress-labels {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.85rem;
+            margin-top: 4px;
+            color: rgba(0,0,0,0.65);
+        }
+        @media (prefers-color-scheme: dark) {
+            .status-progress-labels {
+                color: rgba(255,255,255,0.7);
+            }
+        }
+        .status-warning {
+            margin-top: 8px;
+            font-size: 0.85rem;
+            color: #b7791f;
+        }
+        .log-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 12px;
+            margin-top: 14px;
+        }
+        .log-block {
+            background: rgba(0,0,0,0.03);
+            border-radius: 8px;
+            padding: 10px;
+            display: flex;
+            flex-direction: column;
+            min-height: 220px;
+        }
+        @media (prefers-color-scheme: dark) {
+            .log-block {
+                background: rgba(255,255,255,0.05);
+            }
+        }
+        .log-title {
+            font-weight: 600;
+            margin-bottom: 6px;
+            font-size: 0.9rem;
+        }
+        pre {
+            flex: 1;
+            margin: 0;
+            border-radius: 6px;
+            background: rgba(0,0,0,0.05);
+            padding: 8px;
+            overflow-y: auto;
+            font-size: 0.8rem;
+            white-space: pre-wrap;
+        }
+        @media (prefers-color-scheme: dark) {
+            pre {
+                background: rgba(255,255,255,0.07);
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="status-panel" data-episode="__EPISODE_ID__">
+        <div class="status-header">
+            <strong id="status-stage">Full Pipeline → Initializing</strong>
+            <span id="status-timestamp"></span>
+        </div>
+        <div class="status-progress" data-testid="full-pipeline-progress">
+            <div class="status-progress-bar" id="status-progress-bar"></div>
+        </div>
+        <div class="status-progress-labels">
+            <span id="status-message">Starting Detect/Embed → Track → Cluster → Stills…</span>
+            <span id="status-pct">0%</span>
+        </div>
+        <div class="status-warning" id="status-warning"></div>
+        <div class="log-grid">
+            <div class="log-block">
+                <div class="log-title">Debug Console</div>
+                <pre id="debug-log" data-testid="debug-console">Waiting for workspace debug output…</pre>
+            </div>
+            <div class="log-block">
+                <div class="log-title">Progress Log</div>
+                <pre id="progress-log">Waiting for pipeline progress entries…</pre>
+            </div>
+        </div>
+    </div>
+    <script>
+        const episodeId = "__EPISODE_ID__";
+        const inlineSnapshot = (() => {
+            try {
+                return JSON.parse(decodeURIComponent("__INITIAL_SNAPSHOT__"));
+            } catch (error) {
+                return null;
+            }
+        })();
+
+        const stageEl = document.getElementById("status-stage");
+        const messageEl = document.getElementById("status-message");
+        const pctEl = document.getElementById("status-pct");
+        const progressBarEl = document.getElementById("status-progress-bar");
+        const timestampEl = document.getElementById("status-timestamp");
+        const debugLogEl = document.getElementById("debug-log");
+        const progressLogEl = document.getElementById("progress-log");
+        const warningEl = document.getElementById("status-warning");
+
+        let pollingEnabled = true;
+        let fastCadence = true;
+        let lastSnapshotTs = 0;
+
+        function clampLines(lines) {
+            if (!Array.isArray(lines)) {
+                return [];
+            }
+            return lines.slice(-300);
+        }
+
+        function formatLines(lines) {
+            const clamped = clampLines(lines);
+            if (!clamped.length) {
+                return "No entries yet.";
+            }
+            return clamped.join("\\n");
+        }
+
+        function applySnapshot(snapshot) {
+            if (!snapshot || typeof snapshot !== "object") {
+                return;
+            }
+
+            const progress = snapshot.progress || {};
+            const pipeline = snapshot.pipeline_state || {};
+            const stage = progress.stage || pipeline.current_step || "Full Pipeline";
+            const message = progress.message || pipeline.message || "";
+            const pct = Math.max(0, Math.min(1, Number(progress.pct || 0)));
+
+            stageEl.textContent = `Full Pipeline → ${stage}`;
+            messageEl.textContent = message || "Working…";
+            pctEl.textContent = `${Math.round(pct * 100)}%`;
+            progressBarEl.style.width = `${(pct * 100).toFixed(1)}%`;
+            timestampEl.textContent = snapshot.ts ? new Date(snapshot.ts).toLocaleTimeString() : "";
+
+            const logs = snapshot.logs || {};
+            debugLogEl.textContent = formatLines(logs.workspace);
+            progressLogEl.textContent = formatLines(logs.progress);
+
+            const status = (pipeline.status || "").toLowerCase();
+            if (status === "done" || status === "archived" || pct >= 0.999) {
+                pollingEnabled = false;
+                warningEl.textContent = "✅ Pipeline complete. Snapshot frozen.";
+            }
+        }
+
+        function scheduleNext(interval) {
+            if (!pollingEnabled) {
+                return;
+            }
+            setTimeout(tick, interval);
+        }
+
+        async function tick() {
+            if (!episodeId) {
+                warningEl.textContent = "⚠️ Missing episode identifier.";
+                return;
+            }
+
+            try {
+                const url = `${window.location.origin}/api/status?episode_id=${encodeURIComponent(episodeId)}&t=${Date.now()}`;
+                const response = await fetch(url, { cache: "no-store" });
+                if (!response.ok) {
+                    throw new Error(`Status ${response.status}`);
+                }
+                const payload = await response.json();
+                applySnapshot(payload);
+
+                const ts = Date.parse(payload.ts || Date());
+                if (fastCadence && (payload.progress?.pct > 0 || (ts && ts !== lastSnapshotTs))) {
+                    fastCadence = false;
+                }
+                lastSnapshotTs = ts || lastSnapshotTs;
+                warningEl.textContent = "";
+            } catch (error) {
+                warningEl.textContent = "⚠️ Live snapshot unavailable. Retrying…";
+                console.warn("Status panel fetch error", error);
+            } finally {
+                scheduleNext(fastCadence ? 500 : 2000);
+            }
+        }
+
+        if (inlineSnapshot) {
+            applySnapshot(inlineSnapshot);
+            if (inlineSnapshot.progress?.pct > 0) {
+                fastCadence = false;
+            }
+        }
+
+        if (episodeId) {
+            scheduleNext( fastCadence ? 500 : 2000 );
+        }
+    </script>
+</body>
+</html>
