@@ -46,14 +46,49 @@ def detect_embed_task(job_id: str, episode_id: str) -> dict:
 
     logger.info(f"[DETECT] {episode_key} stage=start job_id={job_id}")
 
-    # CRITICAL: Update envelope and registry at START to show progress in UI
+    # CRITICAL: Create dedicated detect job envelope if standalone
+    # This ensures every detect run has a persistent envelope for UI polling
+    if job_id == "manual":
+        # Standalone detect job - create dedicated envelope
+        job_id = f"detect_{episode_id}"
+        logger.info(f"[DETECT] {episode_key} Creating standalone detect job: {job_id}")
+
+    # Ensure job envelope exists
+    job_dir = Path("data/jobs") / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = job_dir / "meta.json"
+
+    if not meta_path.exists():
+        # Create new envelope
+        envelope = {
+            "job_id": job_id,
+            "episode_id": episode_id,
+            "episode_key": episode_key,
+            "mode": "detect",
+            "created_at": datetime.utcnow().isoformat(),
+            "stages": {"detect": {"status": "running"}},
+            "registry_path": f"data/episodes/{episode_key}/state.json",
+        }
+        with open(meta_path, "w") as f:
+            json.dump(envelope, f, indent=2)
+        logger.info(f"[DETECT] {episode_key} Created job envelope: {meta_path}")
+    else:
+        # Load existing envelope
+        with open(meta_path) as f:
+            envelope = json.load(f)
+        logger.info(f"[DETECT] {episode_key} Loaded existing envelope: {meta_path}")
+
     # Mark stage as running in envelope (for UI polling)
-    if job_id != "manual":
-        try:
-            job_manager.update_stage_status(job_id, "detect", "running")
-            logger.info(f"[DETECT] {episode_key} envelope stage=running")
-        except Exception as e:
-            logger.warning(f"[DETECT] {episode_key} Could not update envelope: {e}")
+    try:
+        job_manager.update_stage_status(job_id, "detect", "running")
+        logger.info(f"[DETECT] {episode_key} envelope stage=running")
+    except Exception as e:
+        # If job_manager fails, update envelope directly
+        logger.warning(f"[DETECT] {episode_key} job_manager failed, updating envelope directly: {e}")
+        envelope["stages"]["detect"]["status"] = "running"
+        envelope["stages"]["detect"]["updated_at"] = datetime.utcnow().isoformat()
+        with open(meta_path, "w") as f:
+            json.dump(envelope, f, indent=2)
 
     # Mark detected=false in registry (will flip to true on success)
     try:
@@ -67,9 +102,14 @@ def detect_embed_task(job_id: str, episode_id: str) -> dict:
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
-    # Setup paths
+    # Setup paths - use episode_id for physical directories
     harvest_dir = Path("data/harvest") / episode_id
     manifest_path = harvest_dir / "manifest.parquet"
+
+    # Create detect artifact directory
+    detect_dir = harvest_dir / "detect"
+    detect_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"[DETECT] {episode_key} Artifact directory: {detect_dir}")
 
     if not manifest_path.exists():
         raise ValueError(f"Manifest not found: {manifest_path}")
@@ -79,8 +119,8 @@ def detect_embed_task(job_id: str, episode_id: str) -> dict:
     logger.info(f"[{job_id}] Loaded manifest with {len(manifest_df)} frames")
 
     # Get video path
-    if job_id == "manual":
-        # Manual workflow: get video path from episode registry
+    if job_id.startswith("detect_"):
+        # Standalone detect job - get video path from episode registry
         from screentime.episode_registry import episode_registry
         episode_data = episode_registry.get_episode(episode_id)
         if not episode_data:
@@ -322,9 +362,10 @@ def detect_embed_task(job_id: str, episode_id: str) -> dict:
                 )
                 last_checkpoint_time = time.time()
 
-                # Update job progress - only for job workflow, not manual
+                # Update job progress - for all job workflows
                 progress_pct = (processed_frames / len(manifest_df)) * 100
-                if job_id != "manual":
+                if not job_id.startswith("detect_"):
+                    # Only update progress for prepare jobs (detect jobs are standalone)
                     from api.jobs import job_manager
                     job_manager.update_job_progress(job_id, "detect_embed", progress_pct)
 
@@ -340,7 +381,7 @@ def detect_embed_task(job_id: str, episode_id: str) -> dict:
 
         # Save embeddings
         embeddings_df = pd.DataFrame(embeddings_data)
-        embeddings_path = harvest_dir / "embeddings.parquet"
+        embeddings_path = detect_dir / "embeddings.parquet"
         embeddings_df.to_parquet(embeddings_path, index=False)
 
         logger.info(f"[{job_id}] Saved {len(embeddings_df)} embeddings to {embeddings_path}")
@@ -456,7 +497,7 @@ def detect_embed_task(job_id: str, episode_id: str) -> dict:
         logger.info(f"[DETECT] {episode_key} stage=end status=ok frames={detection_stats['frames_processed']} faces={detection_stats['faces_detected']}")
 
         # Mark stage as complete in envelope
-        if job_id != "manual":
+        if True:  # Always update envelope for all job types
             try:
                 job_manager.update_stage_status(
                     job_id,
@@ -479,8 +520,8 @@ def detect_embed_task(job_id: str, episode_id: str) -> dict:
             logger.error(f"[DETECT] {episode_key} ERR_REGISTRY_UPDATE_FAILED: {e}")
             raise ValueError(f"ERR_REGISTRY_UPDATE_FAILED: Could not update registry for {episode_key}: {e}")
 
-        # Enqueue next stage (tracking) - only for job workflow, not manual
-        if job_id != "manual":
+        # Enqueue next stage (tracking) - only for prepare jobs, not standalone detect
+        if not job_id.startswith("detect_"):  # Only enqueue tracking for prepare jobs
             job_manager.tracking_queue.enqueue(
                 "jobs.tasks.track.track_task",
                 job_id=job_id,
@@ -504,7 +545,7 @@ def detect_embed_task(job_id: str, episode_id: str) -> dict:
         logger.error(f"[DETECT] {episode_key} stage=end status=error error={str(e)}")
 
         # Mark stage as error in envelope
-        if job_id != "manual":
+        if True:  # Always update envelope for all job types
             try:
                 job_manager.update_stage_status(job_id, "detect", "error", error=str(e))
                 logger.info(f"[DETECT] {episode_key} envelope stage=error")
