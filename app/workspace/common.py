@@ -340,38 +340,54 @@ def check_artifacts_status(episode_id: str, data_root: str = "data") -> Dict[str
         - needs_track: bool
         - needs_cluster: bool
         - needs_stills: bool
+        - detected: bool (replaces legacy "prepared" flag)
+        - prepared: bool (alias for "detected" for backward compatibility)
         - message: human-readable status
         - next_action: suggested action button text
     """
     from jobs.tasks.orchestrate import check_artifacts
+    from app.workspace.constants import STAGE_LABELS
 
     artifacts = check_artifacts(episode_id, Path(data_root))
 
+    # Check if detection is complete (replaces old "prepared" check)
+    detected = artifacts["embeddings"]
+    tracked = artifacts["tracks"]
+    has_stills = artifacts["stills_manifest"] and artifacts["stills_thumbs"]
+
     result = {
         "artifacts": artifacts,
-        "needs_detect": not artifacts["embeddings"],
-        "needs_track": not artifacts["tracks"],
+        "needs_detect": not detected,
+        "needs_track": not tracked,
         "needs_cluster": not artifacts["clusters"],
-        "needs_stills": not (artifacts["stills_manifest"] and artifacts["stills_thumbs"]),
+        "needs_stills": not has_stills,
         "needs_analytics": not artifacts.get("analytics", False),
+
+        # New: explicit stage flags (replaces "prepared")
+        "detected": detected,
+        "tracked": tracked,
+        "has_stills": has_stills,
+
+        # Legacy: "prepared" now means "detected" (for backward compatibility)
+        "prepared": detected,
     }
 
-    # Determine message and next action
+    # Determine message and next action using constants
     if result["needs_detect"]:
         result["message"] = "Face detection and embeddings not found."
-        result["next_action"] = "Run Detect/Embed"
+        result["next_action"] = STAGE_LABELS["detect"]
     elif result["needs_track"]:
         result["message"] = "Face tracking data not found."
-        result["next_action"] = "Run Track"
+        result["next_action"] = STAGE_LABELS["track"]
     elif result["needs_cluster"]:
         result["message"] = "Cluster data not found."
-        result["next_action"] = "Run Cluster"
+        result["next_action"] = STAGE_LABELS["cluster_button"]
     elif result["needs_stills"]:
         result["message"] = "Face stills (thumbnails) not found or incomplete."
-        result["next_action"] = "Generate Stills"
+        result["next_action"] = STAGE_LABELS["stills"]
     elif result["needs_analytics"]:
         result["message"] = "Analytics not found or outdated."
-        result["next_action"] = "Run Analytics"
+        result["next_action"] = STAGE_LABELS["analytics_button"]
     else:
         result["message"] = "All pipeline artifacts are ready."
         result["next_action"] = None
