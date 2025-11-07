@@ -521,6 +521,8 @@ class JobManager:
         Creates jobs/{job_id}/meta.json with job metadata.
         Used for self-healing workers when Redis metadata expires.
 
+        Uses atomic write with flush+fsync to prevent corruption.
+
         Args:
             job_id: Job ID (e.g., 'prepare_RHOBH_S05_E03_11062025')
             envelope: Job envelope dict with job_id, episode_key, mode, stages
@@ -531,14 +533,16 @@ class JobManager:
         meta_file = jobs_dir / "meta.json"
         tmp_file = jobs_dir / "meta.json.tmp"
 
-        # Atomic write
-        with open(tmp_file, "w") as f:
+        # Atomic write with flush+fsync
+        with open(tmp_file, "w", encoding="utf-8") as f:
             json.dump(envelope, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
         tmp_file.replace(meta_file)
 
     def load_job_envelope(self, job_id: str) -> Optional[dict]:
         """
-        Load job envelope from disk.
+        Load job envelope from disk with safe JSON loading.
 
         Args:
             job_id: Job ID
@@ -550,8 +554,10 @@ class JobManager:
         if not meta_file.exists():
             return None
 
-        with open(meta_file) as f:
-            return json.load(f)
+        # Use safe_load_json to handle corruption
+        from screentime.diagnostics.utils import safe_load_json
+        result = safe_load_json(meta_file)
+        return result if result else None
 
     def update_stage_status(self, job_id: str, stage_key: str, status: str, result: Optional[dict] = None, error: Optional[str] = None) -> None:
         """

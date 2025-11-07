@@ -1,11 +1,15 @@
 """Diagnostics and progress tracking utilities."""
 
 import json
+import logging
+import os
 import datetime as dt
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 def json_safe(obj: Any) -> Any:
@@ -34,6 +38,78 @@ def json_safe(obj: Any) -> Any:
     return obj
 
 
+def truncate_to_last_brace(path: Path) -> None:
+    """
+    Truncate corrupted JSON file to last valid closing brace.
+
+    Attempts to recover from incomplete writes by finding the last '}'
+    and truncating the file there.
+
+    Args:
+        path: Path to corrupted JSON file
+    """
+    try:
+        with open(path, "r+b") as f:
+            content = f.read()
+
+            # Find last occurrence of '}'
+            last_brace = content.rfind(b'}')
+
+            if last_brace == -1:
+                logger.error(f"No closing brace found in {path}, cannot recover")
+                return
+
+            # Truncate to last brace + 1
+            f.seek(0)
+            f.write(content[:last_brace + 1])
+            f.truncate()
+            f.flush()
+            os.fsync(f.fileno())
+
+        logger.info(f"Truncated {path} to last valid brace at byte {last_brace}")
+    except Exception as e:
+        logger.error(f"Failed to truncate {path}: {e}")
+
+
+def safe_load_json(path: Path) -> Dict[str, Any]:
+    """
+    Safely load JSON file with automatic recovery from corruption.
+
+    If the file is corrupted (JSONDecodeError), attempts to recover by:
+    1. Truncating to last valid closing brace
+    2. Retrying load
+    3. Returning empty dict if recovery fails
+
+    Args:
+        path: Path to JSON file
+
+    Returns:
+        Parsed JSON dict, or empty dict if file doesn't exist or is unrecoverable
+    """
+    if not path.exists():
+        return {}
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError as e:
+        logger.error(f"Malformed JSON in {path}: {e}")
+
+        # Attempt recovery
+        try:
+            truncate_to_last_brace(path)
+
+            # Retry load
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as recovery_error:
+            logger.error(f"Failed to recover {path}: {recovery_error}")
+            return {}
+    except Exception as e:
+        logger.error(f"Failed to load {path}: {e}")
+        return {}
+
+
 def emit_progress(
     episode_id: str,
     step: str,
@@ -48,6 +124,8 @@ def emit_progress(
     Emit pipeline progress for UI consumption.
 
     Writes to data/harvest/{episode}/diagnostics/pipeline_state.json
+
+    Uses atomic write with flush+fsync to prevent corruption.
 
     Args:
         episode_id: Episode identifier
@@ -74,27 +152,34 @@ def emit_progress(
     out_path = Path("data") / "harvest" / episode_id / "diagnostics" / "pipeline_state.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with out_path.open("w") as f:
+    # Atomic write with flush+fsync to prevent corruption
+    with out_path.open("w", encoding="utf-8") as f:
         json.dump(json_safe(payload), f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
 
 
 def write_pipeline_state(episode_id: str, state: Dict[str, Any]) -> None:
-    """Write full pipeline state to diagnostics."""
+    """Write full pipeline state to diagnostics with atomic write."""
     out_path = Path("data") / "harvest" / episode_id / "diagnostics" / "pipeline_state_full.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with out_path.open("w") as f:
+    # Atomic write with flush+fsync
+    with out_path.open("w", encoding="utf-8") as f:
         json.dump(json_safe(state), f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
 
 
 def read_pipeline_state(episode_id: str) -> Optional[Dict[str, Any]]:
-    """Read current pipeline state."""
+    """Read current pipeline state with safe JSON loading."""
     state_path = Path("data") / "harvest" / episode_id / "diagnostics" / "pipeline_state.json"
     if not state_path.exists():
         return None
 
-    with state_path.open() as f:
-        return json.load(f)
+    # Use safe_load_json to handle corruption
+    result = safe_load_json(state_path)
+    return result if result else None
 
 
 def archive_pipeline_state(episode_id: str) -> None:

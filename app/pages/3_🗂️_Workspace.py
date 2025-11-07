@@ -703,10 +703,43 @@ def main():
                     # Completed
                     st.progress(1.0, text=f"✅ {stage_name}")
                 elif i == step_index:
-                    # Current - add ETA if available
+                    # Current - add ETA and frames_done/frames_total if available
                     stage_pct = pipeline_state.get("pct", 0.5)
                     if stage_pct is None:
                         stage_pct = 0.5
+
+                    # Extract frames_done/frames_total from envelope if available
+                    frames_text = ""
+                    try:
+                        # Try to load job envelope to get frames_done/frames_total
+                        from api.jobs import job_manager
+                        from episodes.runtime import get_active_job
+
+                        episode_key = job_manager.normalize_episode_key(selected_episode)
+                        step_key = step_keys[i - 1]
+
+                        # Get active job for this stage
+                        active_job_id = get_active_job(episode_key, step_key, DATA_ROOT)
+
+                        if active_job_id:
+                            envelope = job_manager.load_job_envelope(active_job_id)
+                            if envelope and "stages" in envelope:
+                                stage_data = envelope["stages"].get(step_key, {})
+                                stage_result = stage_data.get("result", {})
+
+                                frames_done = stage_result.get("frames_done")
+                                frames_total = stage_result.get("frames_total")
+                                faces_detected = stage_result.get("faces_detected")
+                                tracks_active = stage_result.get("tracks_active")
+
+                                if frames_done is not None and frames_total is not None:
+                                    frames_text = f" • {frames_done}/{frames_total} frames"
+                                    if faces_detected is not None:
+                                        frames_text += f" • {faces_detected} faces"
+                                    if tracks_active is not None:
+                                        frames_text += f" • {tracks_active} tracks"
+                    except Exception:
+                        pass  # Could not load envelope data, frames_text will remain empty
 
                     # Calculate ETA for current step
                     try:
@@ -742,7 +775,10 @@ def main():
                     except Exception:
                         eta_text = ""
 
-                    st.progress(float(stage_pct), text=f"⏳ {stage_name}{eta_text}")
+                    # Show progress with percentage and frames info
+                    pct_display = f"{int(stage_pct * 100)}%" if stage_pct > 0 else ""
+                    progress_text = f"⏳ {stage_name} {pct_display}{frames_text}{eta_text}"
+                    st.progress(float(stage_pct), text=progress_text)
                 else:
                     # Pending
                     st.progress(0.0, text=f"⏸️ {stage_name}")

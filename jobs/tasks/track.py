@@ -348,6 +348,36 @@ def track_task(job_id: str, episode_id: str) -> dict:
                 from api.jobs import job_manager
                 job_manager.update_job_progress(job_id, "track", progress_pct)
 
+                # CRITICAL: Emit progress with frames_done/frames_total for UI progress bars
+                try:
+                    from screentime.diagnostics.utils import emit_progress
+
+                    # Update envelope with frames_done/frames_total
+                    job_manager.update_stage_status(
+                        job_id,
+                        "track",
+                        "running",
+                        result={
+                            "frames_done": processed_frames,
+                            "frames_total": len(frame_ids),
+                            "tracks_active": len(active_tracks),
+                            "updated_at": datetime.utcnow().isoformat(),
+                        },
+                    )
+
+                    # Emit progress to pipeline_state.json
+                    emit_progress(
+                        episode_id=episode_id,
+                        step="2. ByteTrack (Track Faces)",
+                        step_index=2,
+                        total_steps=4,
+                        status="running",
+                        message=f"Tracking frames: {processed_frames}/{len(frame_ids)} ({progress_pct:.1f}%) • {len(active_tracks)} active tracks",
+                        pct=progress_pct / 100.0,
+                    )
+                    logger.info(f"[TRACK] {episode_id} heartbeat=tracking frames={processed_frames}/{len(frame_ids)} pct={progress_pct:.1f}% tracks={len(active_tracks)}")
+                except Exception as e:
+                    logger.warning(f"[TRACK] {episode_id} Could not update progress: {e}")
 
             # Telemetry
             telemetry.log(
