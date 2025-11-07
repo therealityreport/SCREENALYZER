@@ -484,17 +484,31 @@ def orchestrate_cluster_only(
             )
 
             if prep_result.get("status") != "ok":
-                error_msg = f"Auto-run of prerequisites failed: {prep_result.get('error', 'Unknown error')}"
-                logger.error(f"[{job_id}] {error_msg}")
+                # Extract detailed error information
+                error_detail = prep_result.get('error', 'Unknown error')
+                error_code = "ERR_PREREQ_FAILED"
 
-                # Emit error progress
+                # Try to extract error code from error message
+                if "ERR_" in str(error_detail):
+                    # Extract error code (e.g., ERR_EMBEDDINGS_MISSING)
+                    import re
+                    match = re.search(r'(ERR_[A-Z_]+)', str(error_detail))
+                    if match:
+                        error_code = match.group(1)
+
+                # Include full result for debugging
+                error_msg = f"{error_code}: Auto-run of prerequisites failed: {error_detail}"
+                logger.error(f"[{job_id}] {error_msg}")
+                logger.error(f"[{job_id}] Full prep_result: {prep_result}")
+
+                # Emit error progress with detailed message
                 emit_progress(
                     episode_id=episode_id,
                     step="Cluster (Auto-run prerequisites)",
                     step_index=1,
                     total_steps=4,
                     status="error",
-                    message=f"Auto-run failed: {error_msg[:200]}",
+                    message=f"{error_code}: {error_detail[:150]}",
                     pct=0.0,
                 )
 
@@ -503,6 +517,9 @@ def orchestrate_cluster_only(
                     "job_id": job_id,
                     "status": "error",
                     "error": error_msg,
+                    "error_code": error_code,
+                    "error_detail": error_detail,
+                    "prep_result": prep_result,  # Include full result for debugging
                 }
 
             logger.info(f"[{job_id}] Prerequisites complete, proceeding to cluster...")

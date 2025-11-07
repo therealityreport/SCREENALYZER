@@ -546,12 +546,23 @@ def detect_embed_task(job_id: str | None = None, episode_id: str | None = None, 
                     },
                 )
 
-        # Save embeddings
+        # Save embeddings atomically to prevent race conditions with Track stage
         embeddings_df = pd.DataFrame(embeddings_data)
         embeddings_path = detect_dir / "embeddings.parquet"
-        embeddings_df.to_parquet(embeddings_path, index=False)
+        embeddings_tmp = detect_dir / "embeddings.parquet.tmp"
 
-        logger.info(f"[{job_id}] Saved {len(embeddings_df)} embeddings to {embeddings_path}")
+        # Write to temp file first
+        embeddings_df.to_parquet(embeddings_tmp, index=False)
+
+        # Fsync to ensure data is written to disk
+        with open(embeddings_tmp, 'r+b') as f:
+            f.flush()
+            os.fsync(f.fileno())
+
+        # Atomic rename
+        os.replace(embeddings_tmp, embeddings_path)
+
+        logger.info(f"[{job_id}] Saved {len(embeddings_df)} embeddings to {embeddings_path} (atomic write)")
 
         # Calculate confidence histogram
         if confidence_values:

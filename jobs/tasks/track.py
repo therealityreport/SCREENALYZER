@@ -177,8 +177,29 @@ def track_task(job_id: str, episode_id: str) -> dict:
     embeddings_path = harvest_dir / "embeddings.parquet"
     manifest_path = harvest_dir / "manifest.parquet"
 
-    if not embeddings_path.exists():
-        raise ValueError(f"Embeddings not found: {embeddings_path}")
+    # Wait for embeddings file with bounded retry (prevent race condition with Detect)
+    max_retries = 50  # 50 × 100ms = 5 seconds total
+    retry_delay = 0.1  # 100ms
+    embeddings_found = False
+
+    for attempt in range(max_retries):
+        if embeddings_path.exists() and embeddings_path.stat().st_size > 0:
+            embeddings_found = True
+            logger.info(f"[{job_id}] Embeddings file found: {embeddings_path} (size={embeddings_path.stat().st_size} bytes)")
+            break
+        elif attempt < max_retries - 1:
+            logger.debug(f"[{job_id}] Waiting for embeddings file (attempt {attempt + 1}/{max_retries})...")
+            time.sleep(retry_delay)
+
+    if not embeddings_found:
+        # Enhanced error with debugging info
+        cwd = Path.cwd()
+        dir_listing = list(harvest_dir.glob("*")) if harvest_dir.exists() else []
+        raise ValueError(
+            f"ERR_EMBEDDINGS_MISSING: Embeddings file not found or empty after {max_retries * retry_delay}s wait. "
+            f"Expected: {embeddings_path}, CWD: {cwd}, "
+            f"harvest_dir contents: {[f.name for f in dir_listing]}"
+        )
 
     if not manifest_path.exists():
         raise ValueError(f"Manifest not found: {manifest_path}")
