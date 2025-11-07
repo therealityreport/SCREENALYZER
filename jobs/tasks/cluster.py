@@ -56,6 +56,18 @@ def cluster_task(job_id: str, episode_id: str) -> dict:
 
     start_time = time.time()
 
+    # Emit initial progress
+    from screentime.diagnostics.utils import emit_progress
+    emit_progress(
+        episode_id=episode_id,
+        step="3. Agglomerative Clustering (Group Tracks)",
+        step_index=3,
+        total_steps=4,
+        status="running",
+        message="Loading tracks and embeddings...",
+        pct=0.0,
+    )
+
     # Load config
     config_path = Path("configs/pipeline.yaml")
     with open(config_path) as f:
@@ -189,6 +201,17 @@ def cluster_task(job_id: str, episode_id: str) -> dict:
     track_embeddings = np.array(track_embeddings)
     logger.info(f"[{job_id}] Computed {len(track_embeddings)} track centroids from picked samples")
 
+    # Emit progress after centroids computed
+    emit_progress(
+        episode_id=episode_id,
+        step="3. Agglomerative Clustering (Group Tracks)",
+        step_index=3,
+        total_steps=4,
+        status="running",
+        message=f"Computed {len(track_embeddings)} track centroids, finding optimal clustering...",
+        pct=0.3,
+    )
+
     # ========================================
     # STEP 3.5: Purity-Driven DBSCAN Epsilon Selection
     # ========================================
@@ -223,6 +246,17 @@ def cluster_task(job_id: str, episode_id: str) -> dict:
     # Save purity diagnostics
     save_purity_diagnostics(episode_id, Path("data"), purity_results)
 
+    # Emit progress after eps selection
+    emit_progress(
+        episode_id=episode_id,
+        step="3. Agglomerative Clustering (Group Tracks)",
+        step_index=3,
+        total_steps=4,
+        status="running",
+        message=f"Eps selected ({eps_chosen:.4f}), running DBSCAN clustering...",
+        pct=0.5,
+    )
+
     # Run clustering with purity-driven eps
     clusterer = DBSCANClusterer(
         eps=eps_chosen,  # Use purity-driven eps
@@ -230,6 +264,17 @@ def cluster_task(job_id: str, episode_id: str) -> dict:
     )
 
     cluster_metadata, track_to_cluster = clusterer.cluster(track_embeddings, track_ids)
+
+    # Emit progress after clustering
+    emit_progress(
+        episode_id=episode_id,
+        step="3. Agglomerative Clustering (Group Tracks)",
+        step_index=3,
+        total_steps=4,
+        status="running",
+        message=f"Built {len(cluster_metadata)} clusters, running contamination audit...",
+        pct=0.7,
+    )
 
     clustering_stats = defaultdict(int)
     clustering_stats["eps_chosen"] = eps_chosen
@@ -344,6 +389,17 @@ def cluster_task(job_id: str, episode_id: str) -> dict:
         )
 
     logger.info(f"[{job_id}] Saved {len(clusters_data)} clusters to {clusters_path}")
+
+    # Emit progress after saving clusters
+    emit_progress(
+        episode_id=episode_id,
+        step="3. Agglomerative Clustering (Group Tracks)",
+        step_index=3,
+        total_steps=4,
+        status="running",
+        message=f"Saved {len(clusters_data)} clusters, generating merge suggestions...",
+        pct=0.9,
+    )
 
     # Generate merge suggestions
     suggester = MergeSuggester(

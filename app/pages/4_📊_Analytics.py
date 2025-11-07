@@ -86,7 +86,7 @@ def render_analytics_page():
         st.info("**Click below to rebuild analytics from current clusters** (always rebuilds from scratch, no cache)")
 
         # Button to generate analytics
-        if st.button("📊 Analyze", type="primary", help="Rebuild analytics from current clusters.json (suppression-aware, always fresh)", key=wkey("analytics_analyze")):
+        if st.button("5. Screenalyzer Analytics (Re-Analyze)", type="primary", help="Rebuild analytics from current clusters.json (suppression-aware, always fresh)", key=wkey("analytics_analyze")):
             with st.spinner("Generating analytics..."):
                 try:
                     # Load cluster assignments from clusters.json

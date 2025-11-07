@@ -142,7 +142,9 @@ def orchestrate_prepare(
         Dict with per-stage results and final state
     """
     if job_id is None:
-        job_id = f"prepare_{episode_id}"
+        # Use unified job ID generator - prepare -> detect for consistency
+        from episodes.runtime import generate_job_id
+        job_id = generate_job_id("detect", episode_id)
 
     harvest_dir = data_root / "harvest" / episode_id
     diagnostics_dir = harvest_dir / "diagnostics"
@@ -399,33 +401,33 @@ def orchestrate_prepare(
     # Update final state
     results["final_state"] = check_artifacts(episode_id, data_root)
 
-    # Mark episode as prepared
+    # Mark pipeline stages complete in pipeline_state.json
     mark_prepared(episode_id, data_root)
-    results["prepared"] = True
+    results["pipeline_complete"] = True
 
     # Emit final "done" progress
     last_result = results.get("stages", {}).get("stills", {}).get("result", {})
     emit_progress(
         episode_id=episode_id,
-        step="Prepare Complete",
+        step="Pipeline Complete",
         step_index=total_steps,
         total_steps=total_steps,
         status="done",
-        message="Tracks & Stills ready → Curate facebank, then Cluster",
-        extra={"result": last_result, "prepared": True},
+        message="Detection, tracking, and stills complete → Curate facebank, then cluster",
+        extra={"result": last_result, "pipeline_complete": True},
     )
 
     if progress_callback:
         progress_callback({
-            "step": "Prepare Complete",
+            "step": "Pipeline Complete",
             "step_index": total_steps,
             "total_steps": total_steps,
             "status": "done",
-            "prepared": True,
+            "pipeline_complete": True,
         })
 
     _save_state(state_file, results)
-    logger.info(f"[{job_id}] Prepare complete: {results['final_state']}")
+    logger.info(f"[{job_id}] Full pipeline complete: {results['final_state']}")
     return results
 
 
@@ -451,18 +453,92 @@ def orchestrate_cluster_only(
         Dict with cluster result
     """
     if job_id is None:
-        job_id = f"cluster_{episode_id}"
+        # Use unified job ID generator
+        from episodes.runtime import generate_job_id
+        job_id = generate_job_id("cluster", episode_id)
 
-    # Check if prepared
+    # Check if detection and tracking are complete - auto-run if missing
     if not is_prepared(episode_id, data_root):
-        error_msg = "Episode not prepared. Run Prepare Tracks & Stills first."
-        logger.error(f"[{job_id}] {error_msg}")
-        return {
-            "episode_id": episode_id,
-            "job_id": job_id,
-            "status": "error",
-            "error": error_msg,
-        }
+        logger.warning(f"[{job_id}] Prerequisites missing (detect/track); auto-running dependencies first.")
+
+        # Emit progress to inform UI about auto-run
+        emit_progress(
+            episode_id=episode_id,
+            step="Cluster (Auto-running prerequisites)",
+            step_index=1,
+            total_steps=4,
+            status="running",
+            message="Auto-running Detect → Track → Stills before clustering...",
+            pct=0.0,
+        )
+
+        # Auto-trigger full pipeline to ensure detect → track → stills are complete
+        try:
+            logger.info(f"[{job_id}] Auto-running full pipeline before cluster...")
+            prep_result = orchestrate_prepare(
+                episode_id=episode_id,
+                data_root=data_root,
+                force=False,  # Skip completed stages
+                resume=True,
+                progress_callback=progress_callback,
+            )
+
+            if prep_result.get("status") != "ok":
+                error_msg = f"Auto-run of prerequisites failed: {prep_result.get('error', 'Unknown error')}"
+                logger.error(f"[{job_id}] {error_msg}")
+
+                # Emit error progress
+                emit_progress(
+                    episode_id=episode_id,
+                    step="Cluster (Auto-run prerequisites)",
+                    step_index=1,
+                    total_steps=4,
+                    status="error",
+                    message=f"Auto-run failed: {error_msg[:200]}",
+                    pct=0.0,
+                )
+
+                return {
+                    "episode_id": episode_id,
+                    "job_id": job_id,
+                    "status": "error",
+                    "error": error_msg,
+                }
+
+            logger.info(f"[{job_id}] Prerequisites complete, proceeding to cluster...")
+
+            # Emit progress indicating prerequisites complete
+            emit_progress(
+                episode_id=episode_id,
+                step="Cluster (Prerequisites complete)",
+                step_index=3,
+                total_steps=4,
+                status="running",
+                message="Detect/Track/Stills complete, starting clustering...",
+                pct=0.75,
+            )
+
+        except Exception as e:
+            error_msg = f"Auto-run of prerequisites failed: {str(e)}"
+            logger.error(f"[{job_id}] {error_msg}")
+
+            # Emit error progress
+            emit_progress(
+                episode_id=episode_id,
+                step="Cluster (Auto-run prerequisites)",
+                step_index=1,
+                total_steps=4,
+                status="error",
+                message=f"Auto-run error: {str(e)[:200]}",
+                pct=0.0,
+            )
+
+            return {
+                "episode_id": episode_id,
+                "job_id": job_id,
+                "status": "error",
+                "error": error_msg,
+            }
 
     harvest_dir = data_root / "harvest" / episode_id
     diagnostics_dir = harvest_dir / "diagnostics"
@@ -470,7 +546,56 @@ def orchestrate_cluster_only(
 
     state_file = diagnostics_dir / "pipeline_state.json"
 
+    # CRITICAL: Validate and repair JSON files before cluster starts
+    # This prevents "Unknown error" from corrupted JSON in prerequisites
+    from screentime.diagnostics.utils import safe_load_json
+
+    json_files_to_validate = [state_file]
+
+    # Also check job envelope if it exists
+    job_envelope_path = data_root / "jobs" / job_id / "meta.json"
+    if job_envelope_path.exists():
+        json_files_to_validate.append(job_envelope_path)
+
+    for json_path in json_files_to_validate:
+        if json_path.exists():
+            try:
+                # Attempt to load and validate - will auto-repair if corrupted
+                data = safe_load_json(json_path)
+                if not data:
+                    logger.warning(f"[JSON-REPAIR] {json_path} invalid before cluster; recovered to empty dict")
+                else:
+                    logger.debug(f"[JSON-VALIDATE] {json_path} validated successfully")
+            except Exception as e:
+                error_msg = f"ERR_PIPELINE_PREREQ_CORRUPT: Cluster prerequisites contained malformed JSON at {json_path}: {e}"
+                logger.error(f"[{job_id}] {error_msg}")
+
+                emit_progress(
+                    episode_id=episode_id,
+                    step="Cluster (JSON Validation)",
+                    step_index=1,
+                    total_steps=1,
+                    status="error",
+                    message=f"JSON validation failed: {str(e)[:200]}",
+                    pct=0.0,
+                )
+
+                return {
+                    "episode_id": episode_id,
+                    "job_id": job_id,
+                    "status": "error",
+                    "error": error_msg,
+                }
+
     logger.info(f"[{job_id}] Running cluster for {episode_id}")
+
+    # CRITICAL: Register active cluster job in runtime for tracking
+    from api.jobs import job_manager
+    from episodes.runtime import set_active_job
+
+    episode_key = job_manager.normalize_episode_key(episode_id)
+    set_active_job(episode_key, "cluster", job_id, data_root)
+    logger.info(f"[CLUSTER] {episode_key} Registered as active job: {job_id}")
 
     # Emit starting progress
     emit_progress(
@@ -507,6 +632,11 @@ def orchestrate_cluster_only(
         except Exception as eta_exc:
             logger.warning(f"Failed to update ETA stats for cluster: {eta_exc}")
 
+        # CRITICAL: Clear active cluster job from runtime on success
+        from episodes.runtime import clear_active_job
+        clear_active_job(episode_key, "cluster", data_root)
+        logger.info(f"[CLUSTER] {episode_key} Cleared active job from runtime")
+
         # Emit success
         emit_progress(
             episode_id=episode_id,
@@ -532,6 +662,14 @@ def orchestrate_cluster_only(
 
     except Exception as exc:
         logger.error(f"[{job_id}] Cluster failed: {exc}", exc_info=True)
+
+        # CRITICAL: Clear active cluster job on error
+        from episodes.runtime import clear_active_job
+        try:
+            clear_active_job(episode_key, "cluster", data_root)
+            logger.info(f"[CLUSTER] {episode_key} Cleared active job from runtime (error)")
+        except Exception as clear_err:
+            logger.warning(f"[CLUSTER] {episode_key} Could not clear active job: {clear_err}")
 
         # Emit error
         emit_progress(
@@ -576,7 +714,9 @@ def orchestrate_analytics_only(
         Dict with analytics result
     """
     if job_id is None:
-        job_id = f"analytics_{episode_id}"
+        # Use unified job ID generator
+        from episodes.runtime import generate_job_id
+        job_id = generate_job_id("analytics", episode_id)
 
     # Check if clusters exist
     artifacts = check_artifacts(episode_id, data_root)

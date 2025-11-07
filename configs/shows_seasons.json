@@ -58,6 +58,16 @@
               "episode_id": "RHOBH_S05_E01_11062025",
               "video_path": "data/videos/rhobh/s05/RHOBH_S05_E01_11062025.mp4",
               "status": "processing"
+            },
+            {
+              "episode_id": "RHOBH_S05_E03_11062025",
+              "video_path": "data/videos/rhobh/s05/RHOBH_S05_E03_11062025.mp4",
+              "status": "processing"
+            },
+            {
+              "episode_id": "RHOBH_S05_E02_11072025",
+              "video_path": "data/videos/rhobh/s05/RHOBH_S05_E02_11072025.mp4",
+              "status": "processing"
             }
           ],
           "created_at": "2025-11-04T21:22:28.339692Z"

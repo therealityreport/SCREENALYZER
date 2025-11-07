@@ -128,12 +128,58 @@ def render_clusters_tab(mutator: WorkspaceMutator) -> None:
     if selected_people:
         low_df = low_df[low_df["name"].isin(selected_people)]
 
-    all_tab, low_tab = st.tabs(["All Clusters", "Low-Confidence Clusters"])
+    # Phase 3 P2: Unassigned clusters filtering
+    unassigned_df = filtered_clusters[
+        (filtered_clusters["name"].isna()) |
+        (filtered_clusters["name"] == "Unknown") |
+        (filtered_clusters["name"] == "Unassigned") |
+        (filtered_clusters["name"] == "Other") |
+        (filtered_clusters["assignment_conf"] < 0.3)
+    ].copy()
+
+    # Phase 3 P2: Sorting dropdown
+    sort_by = st.selectbox(
+        "Sort by",
+        options=[
+            "Assigned Name (A→Z)",
+            "Assignment Confidence (High→Low)",
+            "Cluster Confidence (High→Low)",
+            "Cluster Size (Large→Small)",
+        ],
+        key=wkey("clusters", "sort_by"),
+        help="Sort clusters in all tabs by selected criteria"
+    )
+
+    # Apply sorting to all dataframes
+    def _apply_sorting(df: pd.DataFrame, sort_option: str) -> pd.DataFrame:
+        if df.empty:
+            return df
+        if sort_option == "Assigned Name (A→Z)":
+            return df.sort_values("name", na_position="last")
+        elif sort_option == "Assignment Confidence (High→Low)":
+            return df.sort_values("assignment_conf", ascending=False, na_position="last")
+        elif sort_option == "Cluster Confidence (High→Low)":
+            return df.sort_values("tracks_conf_p25_median", ascending=False, na_position="last")
+        elif sort_option == "Cluster Size (Large→Small)":
+            return df.sort_values("n_tracks", ascending=False)
+        return df
+
+    filtered_clusters = _apply_sorting(filtered_clusters, sort_by)
+    low_df = _apply_sorting(low_df, sort_by)
+    unassigned_df = _apply_sorting(unassigned_df, sort_by)
+
+    # Phase 3 P2: Four sub-views
+    all_tab, pairwise_tab, low_tab, unassigned_tab = st.tabs([
+        "All Clusters",
+        "Pairwise Review",
+        "Low-Confidence",
+        "Unassigned"
+    ])
     selected_cluster = st.session_state.get("workspace_selected_cluster")
 
     with all_tab:
         st.caption(f"{len(filtered_clusters)} clusters")
-        for _, cluster_row in filtered_clusters.sort_values("cluster_id").iterrows():
+        for _, cluster_row in filtered_clusters.iterrows():
             _render_cluster_card(
                 mutator,
                 cluster_row,
@@ -145,13 +191,25 @@ def render_clusters_tab(mutator: WorkspaceMutator) -> None:
                 context="all",
             )
 
+    with pairwise_tab:
+        st.info("🔍 Pairwise Review")
+        st.caption(
+            "This view will show cluster pairs that are potential duplicates for manual merge review. "
+            "Coming in Phase 3 (Refine Clusters)."
+        )
+        st.markdown("**Features in development:**")
+        st.markdown("- Centroid distance < 0.35 detection")
+        st.markdown("- Silhouette score improvement estimation")
+        st.markdown("- Side-by-side cluster comparison")
+        st.markdown("- One-click merge confirmation")
+
     with low_tab:
         if low_df.empty:
             st.success("No low-confidence clusters — great job!")
         else:
             low_threshold = float(thresholds.get("cluster_low_p25", 0.6))
             contam_threshold = float(thresholds.get("cluster_contam_high", 0.2))
-            for _, cluster_row in low_df.sort_values("tracks_conf_p25_median").iterrows():
+            for _, cluster_row in low_df.iterrows():
                 reasons = _cluster_reasons(cluster_row, low_threshold, contam_threshold)
                 _render_cluster_card(
                     mutator,
@@ -163,6 +221,27 @@ def render_clusters_tab(mutator: WorkspaceMutator) -> None:
                     selected_cluster,
                     context="low",
                     reasons=reasons,
+                )
+
+    with unassigned_tab:
+        st.caption(
+            "Clusters with no cast assignment or marked as 'Unknown', 'Unassigned', or 'Other'. "
+            "These are **excluded** from analytics."
+        )
+        if unassigned_df.empty:
+            st.success("✅ All clusters are assigned to cast members!")
+        else:
+            st.caption(f"{len(unassigned_df)} unassigned clusters")
+            for _, cluster_row in unassigned_df.iterrows():
+                _render_cluster_card(
+                    mutator,
+                    cluster_row,
+                    identities,
+                    thresholds,
+                    cluster_map,
+                    track_map,
+                    selected_cluster,
+                    context="unassigned",
                 )
 
     if selected_cluster is not None:
