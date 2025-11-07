@@ -457,6 +457,17 @@ def orchestrate_cluster_only(
     if not is_prepared(episode_id, data_root):
         logger.warning(f"[{job_id}] Prerequisites missing (detect/track); auto-running dependencies first.")
 
+        # Emit progress to inform UI about auto-run
+        emit_progress(
+            episode_id=episode_id,
+            step="Cluster (Auto-running prerequisites)",
+            step_index=1,
+            total_steps=4,
+            status="running",
+            message="Auto-running Detect → Track → Stills before clustering...",
+            pct=0.0,
+        )
+
         # Auto-trigger full pipeline to ensure detect → track → stills are complete
         try:
             logger.info(f"[{job_id}] Auto-running full pipeline before cluster...")
@@ -471,6 +482,18 @@ def orchestrate_cluster_only(
             if prep_result.get("status") != "ok":
                 error_msg = f"Auto-run of prerequisites failed: {prep_result.get('error', 'Unknown error')}"
                 logger.error(f"[{job_id}] {error_msg}")
+
+                # Emit error progress
+                emit_progress(
+                    episode_id=episode_id,
+                    step="Cluster (Auto-run prerequisites)",
+                    step_index=1,
+                    total_steps=4,
+                    status="error",
+                    message=f"Auto-run failed: {error_msg[:200]}",
+                    pct=0.0,
+                )
+
                 return {
                     "episode_id": episode_id,
                     "job_id": job_id,
@@ -479,9 +502,33 @@ def orchestrate_cluster_only(
                 }
 
             logger.info(f"[{job_id}] Prerequisites complete, proceeding to cluster...")
+
+            # Emit progress indicating prerequisites complete
+            emit_progress(
+                episode_id=episode_id,
+                step="Cluster (Prerequisites complete)",
+                step_index=3,
+                total_steps=4,
+                status="running",
+                message="Detect/Track/Stills complete, starting clustering...",
+                pct=0.75,
+            )
+
         except Exception as e:
             error_msg = f"Auto-run of prerequisites failed: {str(e)}"
             logger.error(f"[{job_id}] {error_msg}")
+
+            # Emit error progress
+            emit_progress(
+                episode_id=episode_id,
+                step="Cluster (Auto-run prerequisites)",
+                step_index=1,
+                total_steps=4,
+                status="error",
+                message=f"Auto-run error: {str(e)[:200]}",
+                pct=0.0,
+            )
+
             return {
                 "episode_id": episode_id,
                 "job_id": job_id,
@@ -496,6 +543,14 @@ def orchestrate_cluster_only(
     state_file = diagnostics_dir / "pipeline_state.json"
 
     logger.info(f"[{job_id}] Running cluster for {episode_id}")
+
+    # CRITICAL: Register active cluster job in runtime for tracking
+    from api.jobs import job_manager
+    from episodes.runtime import set_active_job
+
+    episode_key = job_manager.normalize_episode_key(episode_id)
+    set_active_job(episode_key, "cluster", job_id, data_root)
+    logger.info(f"[CLUSTER] {episode_key} Registered as active job: {job_id}")
 
     # Emit starting progress
     emit_progress(
@@ -532,6 +587,11 @@ def orchestrate_cluster_only(
         except Exception as eta_exc:
             logger.warning(f"Failed to update ETA stats for cluster: {eta_exc}")
 
+        # CRITICAL: Clear active cluster job from runtime on success
+        from episodes.runtime import clear_active_job
+        clear_active_job(episode_key, "cluster", data_root)
+        logger.info(f"[CLUSTER] {episode_key} Cleared active job from runtime")
+
         # Emit success
         emit_progress(
             episode_id=episode_id,
@@ -557,6 +617,14 @@ def orchestrate_cluster_only(
 
     except Exception as exc:
         logger.error(f"[{job_id}] Cluster failed: {exc}", exc_info=True)
+
+        # CRITICAL: Clear active cluster job on error
+        from episodes.runtime import clear_active_job
+        try:
+            clear_active_job(episode_key, "cluster", data_root)
+            logger.info(f"[CLUSTER] {episode_key} Cleared active job from runtime (error)")
+        except Exception as clear_err:
+            logger.warning(f"[CLUSTER] {episode_key} Could not clear active job: {clear_err}")
 
         # Emit error
         emit_progress(
