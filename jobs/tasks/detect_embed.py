@@ -81,7 +81,9 @@ def detect_embed_task(job_id: str | None = None, episode_id: str | None = None, 
 
     # CRITICAL: Always normalize job_id to detect_{episode_id} for standalone jobs
     if not job_id or job_id == "manual":
-        job_id = f"detect_{episode_id}"
+        # Use unified job ID generator
+        from episodes.runtime import generate_job_id
+        job_id = generate_job_id("detect", episode_id)
         logger.info(f"[DETECT] Auto-generated job_id={job_id}")
 
     # Log resolved IDs

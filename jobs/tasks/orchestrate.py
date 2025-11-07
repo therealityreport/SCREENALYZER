@@ -142,7 +142,9 @@ def orchestrate_prepare(
         Dict with per-stage results and final state
     """
     if job_id is None:
-        job_id = f"prepare_{episode_id}"
+        # Use unified job ID generator - prepare -> detect for consistency
+        from episodes.runtime import generate_job_id
+        job_id = generate_job_id("detect", episode_id)
 
     harvest_dir = data_root / "harvest" / episode_id
     diagnostics_dir = harvest_dir / "diagnostics"
@@ -451,7 +453,9 @@ def orchestrate_cluster_only(
         Dict with cluster result
     """
     if job_id is None:
-        job_id = f"cluster_{episode_id}"
+        # Use unified job ID generator
+        from episodes.runtime import generate_job_id
+        job_id = generate_job_id("cluster", episode_id)
 
     # Check if detection and tracking are complete - auto-run if missing
     if not is_prepared(episode_id, data_root):
@@ -541,6 +545,47 @@ def orchestrate_cluster_only(
     diagnostics_dir.mkdir(parents=True, exist_ok=True)
 
     state_file = diagnostics_dir / "pipeline_state.json"
+
+    # CRITICAL: Validate and repair JSON files before cluster starts
+    # This prevents "Unknown error" from corrupted JSON in prerequisites
+    from screentime.diagnostics.utils import safe_load_json
+
+    json_files_to_validate = [state_file]
+
+    # Also check job envelope if it exists
+    job_envelope_path = data_root / "jobs" / job_id / "meta.json"
+    if job_envelope_path.exists():
+        json_files_to_validate.append(job_envelope_path)
+
+    for json_path in json_files_to_validate:
+        if json_path.exists():
+            try:
+                # Attempt to load and validate - will auto-repair if corrupted
+                data = safe_load_json(json_path)
+                if not data:
+                    logger.warning(f"[JSON-REPAIR] {json_path} invalid before cluster; recovered to empty dict")
+                else:
+                    logger.debug(f"[JSON-VALIDATE] {json_path} validated successfully")
+            except Exception as e:
+                error_msg = f"ERR_PIPELINE_PREREQ_CORRUPT: Cluster prerequisites contained malformed JSON at {json_path}: {e}"
+                logger.error(f"[{job_id}] {error_msg}")
+
+                emit_progress(
+                    episode_id=episode_id,
+                    step="Cluster (JSON Validation)",
+                    step_index=1,
+                    total_steps=1,
+                    status="error",
+                    message=f"JSON validation failed: {str(e)[:200]}",
+                    pct=0.0,
+                )
+
+                return {
+                    "episode_id": episode_id,
+                    "job_id": job_id,
+                    "status": "error",
+                    "error": error_msg,
+                }
 
     logger.info(f"[{job_id}] Running cluster for {episode_id}")
 
@@ -669,7 +714,9 @@ def orchestrate_analytics_only(
         Dict with analytics result
     """
     if job_id is None:
-        job_id = f"analytics_{episode_id}"
+        # Use unified job ID generator
+        from episodes.runtime import generate_job_id
+        job_id = generate_job_id("analytics", episode_id)
 
     # Check if clusters exist
     artifacts = check_artifacts(episode_id, data_root)
