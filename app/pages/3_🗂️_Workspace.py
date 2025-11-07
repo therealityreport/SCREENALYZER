@@ -471,8 +471,6 @@ def main():
 
             if validated:
                 # Validated but not extracted yet - poll for completion
-                import time
-
                 # Add auto-refresh banner
                 st.info("⏳ Frame extraction in progress... Page will refresh automatically.")
 
@@ -719,7 +717,6 @@ def main():
         st.write(f"Reattaching to job: {active_detect_job}")
         st.caption("The progress polling will now track this job automatically.")
         st.success("✅ Resumed! Polling for progress...")
-        import time
         time.sleep(1)
         st.rerun()
 
@@ -813,7 +810,6 @@ def main():
                             workspace_logger.info(f"[UI] JSON recovery successful | Episode={selected_episode}")
                             
                             # Refresh to show recovered state
-                            import time
                             time.sleep(1)
                             st.rerun()
                         else:
