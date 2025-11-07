@@ -19,27 +19,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 import streamlit as st
 try:
     from streamlit_autorefresh import st_autorefresh
-except ModuleNotFoundError:  # pragma: no cover - fallback when extra isn't installed
-    from streamlit.components.v1 import html as _components_html
-
-    def st_autorefresh(interval: int = 0, key: str | None = None):  # type: ignore[misc]
-        """Minimal JS-based auto-refresh fallback when streamlit_autorefresh isn't available."""
-        if not interval or interval <= 0:
-            return 0
-
-        # Use a hidden HTML block to trigger a parent reload after the interval
-        _components_html(
-            f"""
-            <script>
-                const target = window.parent || window;
-                setTimeout(function () {{
-                    target.location.reload();
-                }}, {int(interval)});
-            </script>
-            """,
-            height=0,
-        )
-        return 0
+except ModuleNotFoundError:  # pragma: no cover - use vendored component
+    from app.vendor.streamlit_autorefresh import st_autorefresh
 
 from app.lib.mutator_api import configure_workspace_mutator
 from app.lib.pipeline import (
