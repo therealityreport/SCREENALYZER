@@ -5,18 +5,21 @@ This page provides thumbnail-first review cards with real metrics from
 cluster_metrics and track_metrics.
 """
 
+import html
 import json
 import logging
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote as url_quote
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import streamlit as st
+import streamlit.components.v1 as components
 try:
     from streamlit_autorefresh import st_autorefresh
 except ModuleNotFoundError:  # pragma: no cover - use vendored component
@@ -36,6 +39,7 @@ from app.components.episode_manager_modal import episode_manager_modal
 from app.workspace.faces import render_faces_tab
 from app.workspace.clusters import render_clusters_tab
 from app.workspace.tracks import render_tracks_tab
+from api.episodes import get_episode_state, get_status_snapshot
 
 # Configure workspace debug logging
 workspace_logger = logging.getLogger("workspace_ui")
@@ -82,6 +86,28 @@ st.set_page_config(
 
 # Constants
 DATA_ROOT = Path("data")
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def resolve_selected_episode() -> str | None:
+    episode = st.session_state.get("selected_episode")
+    if episode:
+        return episode
+
+    episode = (
+        st.session_state.get("route_episode")
+        or st.session_state.get("last_uploaded_episode")
+    )
+    if not episode:
+        options = st.session_state.get("episode_options") or []
+        episode = options[0] if options else None
+
+    if episode:
+        st.session_state["selected_episode"] = episode
+    return episode
 
 
 def read_recent_logs(log_path: Path, episode_id: str | None, run_iso_ts: str | None, limit: int = 100) -> list[str]:
@@ -196,6 +222,125 @@ def schedule_auto_refresh(episode_id: str | None) -> None:
 
     st.session_state.fast_refresh = False
     st_autorefresh(interval=2000, key=f"steady_{episode_id}")
+
+
+@st.cache_data(show_spinner=False)
+def load_status_panel_template() -> str:
+    template_path = Path("app/components/status_panel.html")
+    if not template_path.exists():
+        return ""
+
+    try:
+        return template_path.read_text(encoding="utf-8")
+    except Exception as exc:
+        workspace_logger.warning(f"[STATUS-PANEL] Failed to read template: {exc}")
+        return ""
+
+
+def _clamp_log_lines(lines: list[str] | None, limit: int = 300) -> list[str]:
+    if not lines:
+        return []
+    return list(lines[-limit:])
+
+
+def ensure_snapshot_defaults(snapshot: dict | None, episode_id: str | None, progress_hint: dict | None = None) -> dict:
+    snapshot = snapshot or {}
+    progress_hint = progress_hint or {}
+
+    try:
+        pct_float = float(snapshot.get("progress", {}).get("pct", 0.0))
+    except (TypeError, ValueError):
+        pct_float = float(progress_hint.get("pct", 0.0) or 0.0)
+
+    pct_float = max(0.0, min(pct_float, 1.0))
+
+    stage = snapshot.get("progress", {}).get("stage") or progress_hint.get("stage") or "Full Pipeline"
+    message = snapshot.get("progress", {}).get("message") or progress_hint.get("message") or "Starting Detect/Embed → Track → Cluster → Stills…"
+
+    logs = snapshot.get("logs") or {}
+    snapshot["logs"] = {
+        "workspace": _clamp_log_lines(logs.get("workspace")),
+        "progress": _clamp_log_lines(logs.get("progress")),
+        "workspace_count": logs.get("workspace_count", 0),
+        "progress_count": logs.get("progress_count", 0),
+        **({"fallback": True} if logs.get("fallback") else {}),
+    }
+
+    snapshot["episode_id"] = episode_id
+    snapshot["progress"] = {
+        "stage": stage,
+        "pct": pct_float,
+        "message": message,
+    }
+    snapshot.setdefault("ts", utc_now_iso())
+    return snapshot
+
+
+def build_status_snapshot(episode_id: str | None, last_run_ts: str | None, progress_hint: dict | None = None) -> dict | None:
+    if not episode_id:
+        return None
+
+    snapshot: dict | None
+    try:
+        snapshot = get_status_snapshot(episode_id, last_run_ts=last_run_ts)
+    except Exception as exc:
+        workspace_logger.warning(f"[STATUS-PANEL] Snapshot fetch failed | Episode={episode_id} | Error={exc}")
+        snapshot = {}
+
+    snapshot = ensure_snapshot_defaults(snapshot, episode_id, progress_hint)
+    if last_run_ts:
+        snapshot["last_run_ts"] = last_run_ts
+    return snapshot
+
+
+def render_status_panel_component(template: str, episode_id: str, snapshot: dict) -> None:
+    payload = json.dumps(snapshot).replace("</", "<\\/")
+    html_content = (
+        template
+        .replace("__EPISODE_ID__", html.escape(episode_id))
+        .replace("__INITIAL_SNAPSHOT__", url_quote(payload))
+    )
+    components.html(
+        html_content,
+        height=600,
+        scrolling=True,
+        key=f"status_panel_{episode_id}",
+    )
+
+
+def ensure_full_pipeline_seed(selected_episode: str | None, force: bool = False) -> dict:
+    if not selected_episode:
+        return {}
+
+    expected_job = f"full_{selected_episode}"
+    already_seeded = (
+        st.session_state.get("active_job") == expected_job
+        and st.session_state.get("progress_state")
+        and st.session_state.get("last_run_ts")
+    )
+
+    if already_seeded and not force:
+        return st.session_state.get("progress_state", {})
+
+    now_iso = utc_now_iso()
+    st.session_state.active_job = expected_job
+    st.session_state.last_run_ts = now_iso
+    st.session_state.last_run_start_ts = time.time()
+    st.session_state.active_polling_jobs = {"full": expected_job}
+    st.session_state.fast_refresh = True
+    st.session_state.first_heartbeat_seen = False
+    st.session_state.progress_state = {
+        "stage": "Full Pipeline",
+        "pct": 0.0,
+        "message": "Starting Detect/Embed → Track → Cluster → Stills…",
+    }
+    st.session_state.initial_debug_view = read_recent_logs(
+        workspace_log_file,
+        selected_episode,
+        now_iso,
+        limit=100,
+    )
+    return st.session_state.progress_state
 
 
 def init_workspace_state():
@@ -498,6 +643,7 @@ def main():
                 use_container_width=True,
                 disabled=prepare_disabled,
             ):
+                ensure_full_pipeline_seed(selected_episode, force=True)
                 st.session_state["_trigger_prepare"] = True
         else:
             # Frames not extracted yet - show passive message
@@ -603,6 +749,17 @@ def main():
             safe_rerun()
 
 
+    st.session_state["episode_options"] = episode_ids
+    if selected_episode:
+        st.session_state["selected_episode"] = selected_episode
+
+    selected_episode = resolve_selected_episode()
+    if not selected_episode:
+        st.warning("Select or upload an episode to start the pipeline.")
+        return
+
+    st.session_state.setdefault("last_run_ts", utc_now_iso())
+
     # Manage Episode button - opens modal
     col_manage, col_purge = st.columns([1, 1])
 
@@ -630,6 +787,7 @@ def main():
         st.session_state.episode_id = selected_episode  # For wkey()
         st.session_state.workspace_selected_person = None
         st.session_state.workspace_selected_cluster = None
+        st.session_state.last_run_ts = utc_now_iso()
         safe_rerun()
 
     # Store episode_id for wkey
@@ -664,9 +822,6 @@ def main():
         else:
             # Clear active polling jobs if none found
             st.session_state.active_polling_jobs = {}
-
-    # AUTO-REFRESH: Enable live progress updates while jobs are running
-    schedule_auto_refresh(selected_episode)
 
     # CRITICAL: Show active job status and Resume/Cancel controls
     if active_detect_job:
@@ -862,267 +1017,217 @@ def main():
                     with open(state_file, "w") as f:
                         json.dump(final_state, f, indent=2)
 
-    # Check if we should show progress bars (either pipeline_state says running OR session state has active jobs)
+    progress_hint = st.session_state.get("progress_state") or {
+        "stage": "Full Pipeline",
+        "pct": 0.0,
+        "message": "Starting Detect/Embed → Track → Cluster → Stills…",
+    }
+
     should_show_progress = (
-        st.session_state.get("active_job") or 
-        st.session_state.get("active_polling_jobs") or
-        (pipeline_state and pipeline_state.get("status") not in (None, "done", "archived", "cancelled"))
+        st.session_state.get("active_job")
+        or st.session_state.get("active_polling_jobs")
+        or (pipeline_state and pipeline_state.get("status") not in (None, "done", "archived", "cancelled"))
     )
-    
+
+    status_panel_template = load_status_panel_template()
+    status_panel_snapshot = None
+    status_panel_error = None
+    use_status_panel = bool(should_show_progress and selected_episode and status_panel_template)
+
+    if use_status_panel:
+        status_panel_snapshot = build_status_snapshot(
+            selected_episode,
+            st.session_state.get("last_run_ts"),
+            progress_hint,
+        )
+        if not status_panel_snapshot:
+            status_panel_error = "snapshot unavailable"
+            use_status_panel = False
+
+    auto_refresh_needed = bool(
+        st.session_state.get("active_job") or st.session_state.get("active_polling_jobs")
+    )
+    if auto_refresh_needed and not use_status_panel:
+        schedule_auto_refresh(selected_episode)
+    else:
+        st.session_state.fast_refresh = False
+
     if should_show_progress:
         st.markdown("---")
-        render_primary_progress(st.session_state.get("progress_state"))
-        state_view = pipeline_state or {}
 
-        current_step = state_view.get("current_step", "Unknown")
-        step_index = state_view.get("step_index", 0)
-        total_steps = state_view.get("total_steps", 4)
-        status = state_view.get("status", "unknown")
-        message = state_view.get("message", "")
-
-        if status == "error":
-            st.error(f"❌ Pipeline error: {message}")
-
-            with st.expander("Error details"):
-                st.json(state_view)
-
-            # Check if error is in Stills stage
-            is_stills_error = "stills" in current_step.lower() or "generate" in current_step.lower()
-
-            if is_stills_error:
-                # Stills-specific retry options
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    if st.button("🔁 Resume Stills", key="resume_stills_btn", help="Continue from where it stalled"):
-                        with st.spinner("Resuming stills generation..."):
-                            try:
-                                from jobs.tasks.orchestrate import run_stills_only
-                                result = run_stills_only(selected_episode, data_root=DATA_ROOT, resume=True, force=False)
-                                if result.get("status") == "ok":
-                                    st.success("Stills generation resumed successfully!")
-                                    safe_rerun()
-                                else:
-                                    st.error(f"Resume failed: {result.get('error', 'Unknown error')}")
-                            except Exception as exc:
-                                st.error(f"Resume failed: {exc}")
-                with col2:
-                    if st.button("🔄 Force Re-run Stills", key="force_stills_btn", help="Regenerate all stills from scratch"):
-                        with st.spinner("Regenerating all stills..."):
-                            try:
-                                from jobs.tasks.orchestrate import run_stills_only
-                                result = run_stills_only(selected_episode, data_root=DATA_ROOT, resume=False, force=True)
-                                if result.get("status") == "ok":
-                                    st.success("Stills regenerated successfully!")
-                                    safe_rerun()
-                                else:
-                                    st.error(f"Regeneration failed: {result.get('error', 'Unknown error')}")
-                            except Exception as exc:
-                                st.error(f"Regeneration failed: {exc}")
-                with col3:
-                    if st.button("❌ Clear Error", key="clear_error_btn"):
-                        state_file = DATA_ROOT / "harvest" / selected_episode / "diagnostics" / "pipeline_state.json"
-                        if state_file.exists():
-                            state_file.unlink()
-                        safe_rerun()
-            else:
-                # General retry options
-                col1, col2 = st.columns(2)
-                with col1:
-                    if st.button("🔄 Retry Pipeline", key="retry_pipeline_btn"):
-                        st.session_state["_trigger_cluster"] = True
-                        safe_rerun()
-                with col2:
-                    if st.button("❌ Clear Error", key="clear_error_btn_gen"):
-                        state_file = DATA_ROOT / "harvest" / selected_episode / "diagnostics" / "pipeline_state.json"
-                        if state_file.exists():
-                            state_file.unlink()
-                        safe_rerun()
+        if pipeline_state and pipeline_state.get("status") == "error":
+            render_pipeline_error_controls(pipeline_state, selected_episode)
         else:
-            # Running state
-            overall_pct = (step_index / total_steps) if total_steps > 0 else 0.0
+            render_pipeline_running_controls(pipeline_state, selected_episode)
 
-            col_status, col_cancel = st.columns([4, 1])
-            with col_status:
-                st.info(f"🔄 {current_step} ({step_index}/{total_steps})")
-            with col_cancel:
-                if st.button("⏹️ Cancel Pipeline", key="cancel_pipeline_btn", type="secondary", use_container_width=True):
-                    if cancel_pipeline(selected_episode, DATA_ROOT):
-                        st.success("✅ Pipeline cancelled")
-                        safe_rerun()
-                    else:
-                        st.error("❌ Failed to cancel pipeline")
+        render_primary_progress(progress_hint)
 
-            if message:
-                st.caption(message)
+        if use_status_panel and status_panel_snapshot:
+            render_status_panel_component(status_panel_template, selected_episode, status_panel_snapshot)
+        else:
+            if status_panel_error:
+                st.warning("⚠️ Live status snapshot unavailable. Showing fallback view.")
+            elif not status_panel_template:
+                st.warning("⚠️ Status panel template not found. Showing fallback view.")
 
-            # Per-stage progress bars
-            stages = ["1. RetinaFace + ArcFace (Detect & Embed)", "2. ByteTrack (Track Faces)", "3. Agglomerative Clustering (Group Tracks)", "4. Generate Stills", "5. Screenalyzer Analytics"]
-            # Map display names to step keys used in stats
-            step_keys = ["detect", "track", "cluster", "stills", "analytics"]
+            state_view = pipeline_state or {}
+            current_step = state_view.get("current_step", "Unknown")
+            step_index = state_view.get("step_index", 0)
+            total_steps = state_view.get("total_steps", 4)
+            status = state_view.get("status", "unknown")
+            message = state_view.get("message", "")
 
-            for i, stage_name in enumerate(stages, start=1):
-                if i < step_index:
-                    # Completed
-                    st.progress(1.0, text=f"✅ {stage_name}")
-                elif i == step_index:
-                    # Current - add ETA and frames_done/frames_total if available
-                    stage_pct = state_view.get("pct", 0.5)
-                    if stage_pct is None:
-                        stage_pct = 0.5
+            if status == "error":
+                st.error(f"❌ Pipeline error: {message}")
 
-                    # Extract frames_done/frames_total from envelope if available
-                    frames_text = ""
-                    try:
-                        # Try to load job envelope to get frames_done/frames_total
-                        from api.jobs import job_manager
-                        from episodes.runtime import get_active_job
+                with st.expander("Error details"):
+                    st.json(state_view)
 
-                        episode_key = job_manager.normalize_episode_key(selected_episode)
-                        step_key = step_keys[i - 1]
+                is_stills_error = "stills" in current_step.lower() or "generate" in current_step.lower()
 
-                        # Get active job for this stage
-                        active_job_id = get_active_job(episode_key, step_key, DATA_ROOT)
-
-                        if active_job_id:
-                            envelope = job_manager.load_job_envelope(active_job_id)
-                            if envelope and "stages" in envelope:
-                                stage_data = envelope["stages"].get(step_key, {})
-                                stage_result = stage_data.get("result", {})
-
-                                frames_done = stage_result.get("frames_done")
-                                frames_total = stage_result.get("frames_total")
-                                faces_detected = stage_result.get("faces_detected")
-                                tracks_active = stage_result.get("tracks_active")
-
-                                if frames_done is not None and frames_total is not None:
-                                    frames_text = f" • {frames_done}/{frames_total} frames"
-                                    if faces_detected is not None:
-                                        frames_text += f" • {faces_detected} faces"
-                                    if tracks_active is not None:
-                                        frames_text += f" • {tracks_active} tracks"
-                    except Exception:
-                        pass  # Could not load envelope data, frames_text will remain empty
-
-                    # Calculate ETA for current step
-                    try:
-                        step_key = step_keys[i - 1]
-                        operation = "prepare"  # Default operation
-
-                        # Determine operation type from pipeline state
-                        if "cluster" in current_step.lower():
-                            operation = "cluster"
-                        elif "analyt" in current_step.lower():
-                            operation = "analytics"
-
-                        # Get remaining steps
-                        remaining_steps = [step_keys[j] for j in range(i, len(step_keys))]
-
-                        eta_info = calculate_eta(
-                            selected_episode,
-                            operation,
-                            step_key,
-                            remaining_steps,
-                            current_step_elapsed_s=0.0,
-                            data_root=DATA_ROOT
-                        )
-
-                        eta_seconds = eta_info.get("eta_seconds", 0)
-                        confidence = eta_info.get("confidence", "none")
-
-                        if confidence == "none" or eta_seconds <= 0:
-                            eta_text = " • learning ETA..."
-                        else:
-                            eta_formatted = format_eta(eta_seconds)
-                            eta_text = f" • ETA: ~{eta_formatted}"
-                    except Exception:
-                        eta_text = ""
-
-                    # Show progress with percentage and frames info
-                    pct_display = f"{int(stage_pct * 100)}%" if stage_pct > 0 else ""
-                    progress_text = f"⏳ {stage_name} {pct_display}{frames_text}{eta_text}"
-                    st.progress(float(stage_pct), text=progress_text)
+                if is_stills_error:
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        if st.button("🔁 Resume Stills", key="resume_stills_btn", help="Continue from where it stalled"):
+                            with st.spinner("Resuming stills generation..."):
+                                try:
+                                    from jobs.tasks.orchestrate import run_stills_only
+                                    result = run_stills_only(selected_episode, data_root=DATA_ROOT, resume=True, force=False)
+                                    if result.get("status") == "ok":
+                                        st.success("Stills generation resumed successfully!")
+                                        safe_rerun()
+                                    else:
+                                        st.error(f"Resume failed: {result.get('error', 'Unknown error')}")
+                                except Exception as exc:
+                                    st.error(f"Resume failed: {exc}")
+                    with col2:
+                        if st.button("🔄 Force Re-run Stills", key="force_stills_btn", help="Regenerate all stills from scratch"):
+                            with st.spinner("Regenerating all stills..."):
+                                try:
+                                    from jobs.tasks.orchestrate import run_stills_only
+                                    result = run_stills_only(selected_episode, data_root=DATA_ROOT, resume=False, force=True)
+                                    if result.get("status") == "ok":
+                                        st.success("Stills regenerated successfully!")
+                                        safe_rerun()
+                                    else:
+                                        st.error(f"Regeneration failed: {result.get('error', 'Unknown error')}")
+                                except Exception as exc:
+                                    st.error(f"Regeneration failed: {exc}")
+                    with col3:
+                        if st.button("❌ Clear Error", key="clear_error_btn"):
+                            state_file = DATA_ROOT / "harvest" / selected_episode / "diagnostics" / "pipeline_state.json"
+                            if state_file.exists():
+                                state_file.unlink()
+                            safe_rerun()
                 else:
-                    # Pending
-                    st.progress(0.0, text=f"⏸️ {stage_name}")
-
-        # Debug Console
-        with st.expander("🪵 Debug Console", expanded=False):
-            # TASK 4 & 5: Per-run filtering and Clear Console button
-            # Initialize last_run_ts in session state
-            if "last_run_ts" not in st.session_state:
-                st.session_state.last_run_ts = None
-
-            # Header row with caption and Clear Console button
-            col_caption, col_clear = st.columns([4, 1])
-            with col_caption:
-                if st.session_state.last_run_ts:
-                    st.caption(f"Logs since last run: {st.session_state.last_run_ts}")
-                else:
-                    st.caption("Real-time workspace debug log (last 500 lines)")
-            with col_clear:
-                if st.button("Clear Console", key="clear_console_btn", help="Reset log view to current timestamp"):
-                    st.session_state.last_run_ts = datetime.utcnow().isoformat()
-                    st.session_state.pop("initial_debug_view", None)
-                    workspace_logger.info(f"[CONSOLE] Cleared console, reset last_run_ts to {st.session_state.last_run_ts}")
-                    st.rerun()
-
-            initial_lines = st.session_state.pop("initial_debug_view", None)
-            if initial_lines is not None:
-                initial_content = "".join(initial_lines)
-                if not initial_content.strip():
-                    initial_content = "⏳ Initializing debug console for this run..."
-                st.code(initial_content, language="log")
-            elif workspace_log_file.exists():
-                try:
-                    with open(workspace_log_file, "r", encoding="utf-8") as f:
-                        lines = f.readlines()
-                        last_500 = lines[-500:] if len(lines) > 500 else lines
-
-                        # TASK 4: Filter logs to only show entries since last_run_ts
-                        if st.session_state.last_run_ts:
-                            filtered_lines = []
-                            last_run_dt = datetime.fromisoformat(st.session_state.last_run_ts.replace('Z', '+00:00') if 'Z' in st.session_state.last_run_ts else st.session_state.last_run_ts)
-
-                            for line in last_500:
-                                # Parse timestamp from log format: [YYYY-MM-DDTHH:MM:SS.ffffff] or [YYYY-MM-DD HH:MM:SS]
-                                match = re.match(r'\[(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?)\]', line)
-                                if match:
-                                    try:
-                                        timestamp_str = match.group(1).replace(' ', 'T')  # Normalize to ISO format
-                                        line_dt = datetime.fromisoformat(timestamp_str)
-                                        if line_dt >= last_run_dt:
-                                            filtered_lines.append(line)
-                                    except Exception:
-                                        # If we can't parse the timestamp, include the line
-                                        filtered_lines.append(line)
-                                else:
-                                    # No timestamp found, might be continuation line
-                                    if filtered_lines:  # Only include if we have previous filtered lines
-                                        filtered_lines.append(line)
-
-                                # Also check for [RUN-START] markers and extract ts=
-                                if "[RUN-START]" in line and "ts=" in line:
-                                    ts_match = re.search(r'ts=([\d\-T:.]+)', line)
-                                    if ts_match:
-                                        try:
-                                            run_start_ts = ts_match.group(1)
-                                            # Update session state with the most recent run start
-                                            st.session_state.last_run_ts = run_start_ts
-                                            workspace_logger.debug(f"[CONSOLE] Found RUN-START marker, updated last_run_ts to {run_start_ts}")
-                                        except Exception:
-                                            pass
-
-                            log_content = "".join(filtered_lines) if filtered_lines else "No logs since last run. Click 'Clear Console' to reset."
-                        else:
-                            log_content = "".join(last_500)
-
-                    st.code(log_content or "No debug log output yet.", language="log")
-                except Exception as e:
-                    st.error(f"Could not read debug log: {e}")
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        if st.button("🔄 Retry Pipeline", key="retry_pipeline_btn"):
+                            st.session_state["_trigger_cluster"] = True
+                            safe_rerun()
+                    with col2:
+                        if st.button("❌ Clear Error", key="clear_error_btn_gen"):
+                            state_file = DATA_ROOT / "harvest" / selected_episode / "diagnostics" / "pipeline_state.json"
+                            if state_file.exists():
+                                state_file.unlink()
+                            safe_rerun()
             else:
-                st.info("No debug log available yet. Debug events will appear here during pipeline runs.")
+                col_status, col_cancel = st.columns([4, 1])
+                with col_status:
+                    st.info(f"🔄 {current_step} ({step_index}/{total_steps})")
+                with col_cancel:
+                    if st.button("⏹️ Cancel Pipeline", key="cancel_pipeline_btn", type="secondary", use_container_width=True):
+                        if cancel_pipeline(selected_episode, DATA_ROOT):
+                            st.success("✅ Pipeline cancelled")
+                            safe_rerun()
+                        else:
+                            st.error("❌ Failed to cancel pipeline")
 
-        st.markdown("---")
+                if message:
+                    st.caption(message)
+
+                stages = [
+                    "1. RetinaFace + ArcFace (Detect & Embed)",
+                    "2. ByteTrack (Track Faces)",
+                    "3. Agglomerative Clustering (Group Tracks)",
+                    "4. Generate Stills",
+                    "5. Screenalyzer Analytics",
+                ]
+                step_keys = ["detect", "track", "cluster", "stills", "analytics"]
+
+                for i, stage_name in enumerate(stages, start=1):
+                    if i < step_index:
+                        st.progress(1.0, text=f"✅ {stage_name}")
+                    elif i == step_index:
+                        stage_pct = state_view.get("pct", 0.5)
+                        if stage_pct is None:
+                            stage_pct = 0.5
+
+                        frames_text = ""
+                        try:
+                            from api.jobs import job_manager
+                            from episodes.runtime import get_active_job
+
+                            episode_key = job_manager.normalize_episode_key(selected_episode)
+                            step_key = step_keys[i - 1]
+                            active_job_id = get_active_job(episode_key, step_key, DATA_ROOT)
+
+                            if active_job_id:
+                                envelope = job_manager.load_job_envelope(active_job_id)
+                                if envelope and "stages" in envelope:
+                                    stage_data = envelope["stages"].get(step_key, {})
+                                    stage_result = stage_data.get("result", {})
+
+                                    frames_done = stage_result.get("frames_done")
+                                    frames_total = stage_result.get("frames_total")
+                                    faces_detected = stage_result.get("faces_detected")
+                                    tracks_active = stage_result.get("tracks_active")
+
+                                    if frames_done is not None and frames_total is not None:
+                                        frames_text = f" • {frames_done}/{frames_total} frames"
+                                        if faces_detected is not None:
+                                            frames_text += f" • {faces_detected} faces"
+                                        if tracks_active is not None:
+                                            frames_text += f" • {tracks_active} tracks"
+                        except Exception:
+                            pass
+
+                        try:
+                            step_key = step_keys[i - 1]
+                            operation = "prepare"
+
+                            if "cluster" in current_step.lower():
+                                operation = "cluster"
+                            elif "analyt" in current_step.lower():
+                                operation = "analytics"
+
+                            remaining_steps = [step_keys[j] for j in range(i, len(step_keys))]
+
+                            eta_info = calculate_eta(
+                                selected_episode,
+                                operation,
+                                step_key,
+                                remaining_steps,
+                                current_step_elapsed_s=0.0,
+                                data_root=DATA_ROOT
+                            )
+
+                            eta_seconds = eta_info.get("eta_seconds", 0)
+                            confidence = eta_info.get("confidence", "none")
+
+                            if confidence == "none" or eta_seconds <= 0:
+                                eta_text = " • learning ETA..."
+                            else:
+                                eta_formatted = format_eta(eta_seconds)
+                                eta_text = f" • ETA: ~{eta_formatted}"
+                        except Exception:
+                            eta_text = ""
+
+                        pct_display = f"{int(stage_pct * 100)}%" if stage_pct > 0 else ""
+                        progress_text = f"⏳ {stage_name} {pct_display}{frames_text}{eta_text}"
+                        st.progress(float(stage_pct), text=progress_text)
+                    else:
+                        st.progress(0.0, text=f"⏸️ {stage_name}")
 
     # Handle Prepare button click
     if st.session_state.pop("_trigger_prepare", False):
@@ -1132,7 +1237,7 @@ def main():
 
         # CRITICAL FIX: Set session state BEFORE calling backend to enable immediate UI updates
         st.session_state.active_job = f"full_{selected_episode}"
-        st.session_state.last_run_ts = datetime.utcnow().isoformat()
+        st.session_state.last_run_ts = utc_now_iso()
         st.session_state.last_run_start_ts = time.time()
         st.session_state.active_polling_jobs = {"full": f"full_{selected_episode}"}
         st.session_state.fast_refresh = True

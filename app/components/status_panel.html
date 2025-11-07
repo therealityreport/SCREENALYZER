@@ -11,8 +11,8 @@
             background: transparent;
         }
         .status-panel {
-            border-radius: 10px;
             border: 1px solid rgba(0,0,0,0.08);
+            border-radius: 10px;
             padding: 16px;
             background: rgba(255,255,255,0.7);
             backdrop-filter: blur(8px);
@@ -31,9 +31,7 @@
             margin-bottom: 8px;
             font-size: 0.95rem;
         }
-        .status-header strong {
-            font-size: 1rem;
-        }
+        .status-header strong { font-size: 1rem; }
         .status-progress {
             position: relative;
             width: 100%;
@@ -43,15 +41,11 @@
             overflow: hidden;
         }
         @media (prefers-color-scheme: dark) {
-            .status-progress {
-                background: rgba(255,255,255,0.12);
-            }
+            .status-progress { background: rgba(255,255,255,0.12); }
         }
         .status-progress-bar {
             position: absolute;
-            left: 0;
-            top: 0;
-            bottom: 0;
+            inset: 0;
             width: 0%;
             border-radius: 999px;
             background: linear-gradient(90deg, #00c6ff, #0072ff);
@@ -65,9 +59,7 @@
             color: rgba(0,0,0,0.65);
         }
         @media (prefers-color-scheme: dark) {
-            .status-progress-labels {
-                color: rgba(255,255,255,0.7);
-            }
+            .status-progress-labels { color: rgba(255,255,255,0.75); }
         }
         .status-warning {
             margin-top: 8px;
@@ -89,14 +81,23 @@
             min-height: 220px;
         }
         @media (prefers-color-scheme: dark) {
-            .log-block {
-                background: rgba(255,255,255,0.05);
-            }
+            .log-block { background: rgba(255,255,255,0.05); }
         }
         .log-title {
             font-weight: 600;
             margin-bottom: 6px;
             font-size: 0.9rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+        }
+        .log-note {
+            font-weight: 400;
+            font-size: 0.75rem;
+            color: rgba(0,0,0,0.6);
+        }
+        @media (prefers-color-scheme: dark) {
+            .log-note { color: rgba(255,255,255,0.6); }
         }
         pre {
             flex: 1;
@@ -109,9 +110,7 @@
             white-space: pre-wrap;
         }
         @media (prefers-color-scheme: dark) {
-            pre {
-                background: rgba(255,255,255,0.07);
-            }
+            pre { background: rgba(255,255,255,0.07); }
         }
     </style>
 </head>
@@ -131,7 +130,10 @@
         <div class="status-warning" id="status-warning"></div>
         <div class="log-grid">
             <div class="log-block">
-                <div class="log-title">Debug Console</div>
+                <div class="log-title">
+                    Debug Console
+                    <span id="debug-caption" class="log-note"></span>
+                </div>
                 <pre id="debug-log" data-testid="debug-console">Waiting for workspace debug output…</pre>
             </div>
             <div class="log-block">
@@ -141,117 +143,157 @@
         </div>
     </div>
     <script>
-        const episodeId = "__EPISODE_ID__";
-        const inlineSnapshot = (() => {
-            try {
-                return JSON.parse(decodeURIComponent("__INITIAL_SNAPSHOT__"));
-            } catch (error) {
-                return null;
-            }
-        })();
-
-        const stageEl = document.getElementById("status-stage");
-        const messageEl = document.getElementById("status-message");
-        const pctEl = document.getElementById("status-pct");
-        const progressBarEl = document.getElementById("status-progress-bar");
-        const timestampEl = document.getElementById("status-timestamp");
-        const debugLogEl = document.getElementById("debug-log");
-        const progressLogEl = document.getElementById("progress-log");
-        const warningEl = document.getElementById("status-warning");
-
-        let pollingEnabled = true;
-        let fastCadence = true;
-        let lastSnapshotTs = 0;
-
-        function clampLines(lines) {
-            if (!Array.isArray(lines)) {
-                return [];
-            }
-            return lines.slice(-300);
-        }
-
-        function formatLines(lines) {
-            const clamped = clampLines(lines);
-            if (!clamped.length) {
-                return "No entries yet.";
-            }
-            return clamped.join("\\n");
-        }
-
-        function applySnapshot(snapshot) {
-            if (!snapshot || typeof snapshot !== "object") {
-                return;
-            }
-
-            const progress = snapshot.progress || {};
-            const pipeline = snapshot.pipeline_state || {};
-            const stage = progress.stage || pipeline.current_step || "Full Pipeline";
-            const message = progress.message || pipeline.message || "";
-            const pct = Math.max(0, Math.min(1, Number(progress.pct || 0)));
-
-            stageEl.textContent = `Full Pipeline → ${stage}`;
-            messageEl.textContent = message || "Working…";
-            pctEl.textContent = `${Math.round(pct * 100)}%`;
-            progressBarEl.style.width = `${(pct * 100).toFixed(1)}%`;
-            timestampEl.textContent = snapshot.ts ? new Date(snapshot.ts).toLocaleTimeString() : "";
-
-            const logs = snapshot.logs || {};
-            debugLogEl.textContent = formatLines(logs.workspace);
-            progressLogEl.textContent = formatLines(logs.progress);
-
-            const status = (pipeline.status || "").toLowerCase();
-            if (status === "done" || status === "archived" || pct >= 0.999) {
-                pollingEnabled = false;
-                warningEl.textContent = "✅ Pipeline complete. Snapshot frozen.";
-            }
-        }
-
-        function scheduleNext(interval) {
-            if (!pollingEnabled) {
-                return;
-            }
-            setTimeout(tick, interval);
-        }
-
-        async function tick() {
-            if (!episodeId) {
-                warningEl.textContent = "⚠️ Missing episode identifier.";
-                return;
-            }
-
-            try {
-                const url = `${window.location.origin}/api/status?episode_id=${encodeURIComponent(episodeId)}&t=${Date.now()}`;
-                const response = await fetch(url, { cache: "no-store" });
-                if (!response.ok) {
-                    throw new Error(`Status ${response.status}`);
+        (function () {
+            const episodeId = "__EPISODE_ID__";
+            const initialSnapshot = (() => {
+                try {
+                    return JSON.parse(decodeURIComponent("__INITIAL_SNAPSHOT__"));
+                } catch {
+                    return null;
                 }
-                const payload = await response.json();
-                applySnapshot(payload);
+            })();
 
-                const ts = Date.parse(payload.ts || Date());
-                if (fastCadence && (payload.progress?.pct > 0 || (ts && ts !== lastSnapshotTs))) {
+            const stageEl = document.getElementById("status-stage");
+            const messageEl = document.getElementById("status-message");
+            const pctEl = document.getElementById("status-pct");
+            const progressBarEl = document.getElementById("status-progress-bar");
+            const timestampEl = document.getElementById("status-timestamp");
+            const debugLogEl = document.getElementById("debug-log");
+            const debugCaptionEl = document.getElementById("debug-caption");
+            const progressLogEl = document.getElementById("progress-log");
+            const warningEl = document.getElementById("status-warning");
+
+            const MAX_LINES = 300;
+            const STOP_STAGES = ["generate stills", "3. agglomerative clustering (group tracks)"];
+
+            let pollingEnabled = true;
+            let fastCadence = true;
+            let lastSnapshotTs = 0;
+            let lastRunTsValue = initialSnapshot?.last_run_ts || "";
+
+            function clampLines(lines) {
+                if (!Array.isArray(lines)) {
+                    return [];
+                }
+                return lines.slice(-MAX_LINES);
+            }
+
+            function formatLines(lines) {
+                const clamped = clampLines(lines);
+                return clamped.length ? clamped.join("\n") : "No entries yet.";
+            }
+
+            function renderConsole(lines, fallback) {
+                debugLogEl.textContent = formatLines(lines);
+                debugCaptionEl.textContent = fallback ? "(showing progress log)" : "";
+            }
+
+            function renderProgress(progress, snapshotTs) {
+                const pct = Math.max(0, Math.min(1, Number(progress.pct || 0)));
+                const stage = progress.stage || "Full Pipeline";
+                const message = progress.message || "Working…";
+
+                stageEl.textContent = `Full Pipeline → ${stage}`;
+                messageEl.textContent = message;
+                pctEl.textContent = `${Math.round(pct * 100)}%`;
+                progressBarEl.style.width = `${(pct * 100).toFixed(1)}%`;
+                timestampEl.textContent = snapshotTs ? new Date(snapshotTs).toLocaleTimeString() : "";
+            }
+
+            function shouldStopPolling(snapshot) {
+                const pipeline = snapshot.pipeline_state || {};
+                const status = (pipeline.status || "").toLowerCase();
+                if (status === "done" || status === "archived") {
+                    warningEl.textContent = "✅ Pipeline complete. Snapshot frozen.";
+                    return true;
+                }
+
+                const stage = (snapshot.progress?.stage || pipeline.current_step || "").toLowerCase();
+                const pct = Number(snapshot.progress?.pct || 0);
+                if (pct >= 0.999 && STOP_STAGES.some((s) => stage.includes(s))) {
+                    warningEl.textContent = "✅ Pipeline complete. Snapshot frozen.";
+                    return true;
+                }
+                return false;
+            }
+
+            function applySnapshot(snapshot) {
+                if (!snapshot || typeof snapshot !== "object") {
+                    return;
+                }
+
+                renderProgress(snapshot.progress || {}, snapshot.ts);
+
+                const logs = snapshot.logs || {};
+                const workspaceLines = logs.workspace || [];
+                const progressLines = logs.progress || [];
+                const useFallback = logs.fallback || (!workspaceLines.length && progressLines.length);
+
+                renderConsole(useFallback ? progressLines : workspaceLines, useFallback);
+                progressLogEl.textContent = formatLines(progressLines);
+
+                if (snapshot.last_run_ts) {
+                    lastRunTsValue = snapshot.last_run_ts;
+                }
+
+                if (shouldStopPolling(snapshot)) {
+                    pollingEnabled = false;
+                }
+            }
+
+            function scheduleNext(interval) {
+                if (!pollingEnabled) {
+                    return;
+                }
+                setTimeout(tick, interval);
+            }
+
+            async function tick() {
+                if (!pollingEnabled || !episodeId) {
+                    return;
+                }
+
+                try {
+                    const url = new URL("/api/status", window.location.origin);
+                    url.searchParams.set("episode_id", episodeId);
+                    if (lastRunTsValue) {
+                        url.searchParams.set("last_run_ts", lastRunTsValue);
+                    }
+                    url.searchParams.set("t", Date.now().toString());
+
+                    const response = await fetch(url.toString(), { cache: "no-store" });
+                    if (!response.ok) {
+                        throw new Error(`Status ${response.status}`);
+                    }
+
+                    const payload = await response.json();
+                    applySnapshot(payload);
+
+                    const snapshotTs = Date.parse(payload.ts || Date());
+                    if (fastCadence && (Number(payload.progress?.pct || 0) > 0 || snapshotTs !== lastSnapshotTs)) {
+                        fastCadence = false;
+                    }
+                    lastSnapshotTs = snapshotTs || lastSnapshotTs;
+                    warningEl.textContent = "";
+                } catch (error) {
+                    warningEl.textContent = "⚠️ Live snapshot unavailable. Retrying…";
+                    console.warn("Status panel fetch error", error);
+                } finally {
+                    scheduleNext(fastCadence ? 500 : 2000);
+                }
+            }
+
+            if (initialSnapshot) {
+                applySnapshot(initialSnapshot);
+                if (Number(initialSnapshot.progress?.pct || 0) > 0) {
                     fastCadence = false;
                 }
-                lastSnapshotTs = ts || lastSnapshotTs;
-                warningEl.textContent = "";
-            } catch (error) {
-                warningEl.textContent = "⚠️ Live snapshot unavailable. Retrying…";
-                console.warn("Status panel fetch error", error);
-            } finally {
+            }
+
+            if (episodeId) {
                 scheduleNext(fastCadence ? 500 : 2000);
             }
-        }
-
-        if (inlineSnapshot) {
-            applySnapshot(inlineSnapshot);
-            if (inlineSnapshot.progress?.pct > 0) {
-                fastCadence = false;
-            }
-        }
-
-        if (episodeId) {
-            scheduleNext( fastCadence ? 500 : 2000 );
-        }
+        })();
     </script>
 </body>
 </html>
