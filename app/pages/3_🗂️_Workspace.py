@@ -7,13 +7,17 @@ cluster_metrics and track_metrics.
 
 import json
 import logging
+import re
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 from app.lib.mutator_api import configure_workspace_mutator
 from app.lib.pipeline import (
@@ -75,6 +79,120 @@ st.set_page_config(
 
 # Constants
 DATA_ROOT = Path("data")
+
+
+def read_recent_logs(log_path: Path, episode_id: str | None, run_iso_ts: str | None, limit: int = 100) -> list[str]:
+    """Read recent workspace debug lines preferring those after a run-start marker or timestamp."""
+    if not log_path.exists():
+        return []
+
+    try:
+        with open(log_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except Exception:
+        return []
+
+    if not lines:
+        return []
+
+    marker_index = None
+    marker_token = f"ts={run_iso_ts}" if run_iso_ts else None
+    if episode_id:
+        for idx in range(len(lines) - 1, -1, -1):
+            line = lines[idx]
+            if "[RUN-START]" in line and f"episode={episode_id}" in line:
+                if marker_token and marker_token in line:
+                    marker_index = idx
+                    break
+                if marker_token is None:
+                    marker_index = idx
+                    break
+
+    candidate = lines[marker_index + 1 :] if marker_index is not None else lines[-limit * 3 :]
+
+    if run_iso_ts:
+        normalized = run_iso_ts.replace("Z", "+00:00") if "Z" in run_iso_ts else run_iso_ts
+        try:
+            run_dt = datetime.fromisoformat(normalized)
+        except Exception:
+            run_dt = None
+
+        if run_dt:
+            ts_pattern = re.compile(r"\[(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?)\]")
+            filtered: list[str] = []
+            for line in candidate:
+                match = ts_pattern.match(line)
+                if match:
+                    ts_str = match.group(1).replace(" ", "T")
+                    try:
+                        ts_dt = datetime.fromisoformat(ts_str)
+                    except Exception:
+                        ts_dt = None
+                    if ts_dt and ts_dt >= run_dt:
+                        filtered.append(line)
+                else:
+                    if filtered:
+                        filtered.append(line)
+            if filtered:
+                candidate = filtered
+
+    if not candidate:
+        return []
+
+    return candidate[-limit:]
+
+
+def render_primary_progress(progress_state: dict | None) -> None:
+    """Render a top-level progress indicator using pre-seeded session state."""
+    if not progress_state:
+        return
+
+    stage = progress_state.get("stage") or "Full Pipeline"
+    message = progress_state.get("message") or ""
+
+    pct_val = progress_state.get("pct", 0.0) or 0.0
+    try:
+        pct_float = float(pct_val)
+    except (TypeError, ValueError):
+        pct_float = 0.0
+    pct_clamped = max(0.0, min(pct_float, 1.0))
+
+    text = f"⏳ {stage}"
+    if message:
+        text = f"{text} • {message}"
+
+    st.progress(pct_clamped, text=text)
+
+
+def schedule_auto_refresh(episode_id: str | None) -> None:
+    """Trigger dual cadence auto-refresh while a job is active."""
+    active_jobs = st.session_state.get("active_polling_jobs", {})
+    active_job_id = st.session_state.get("active_job")
+
+    if not episode_id or not (active_job_id or active_jobs):
+        st.session_state.fast_refresh = False
+        return
+
+    now = time.time()
+    last_run_start_ts = st.session_state.get("last_run_start_ts", now)
+    first_heartbeat = st.session_state.get("first_heartbeat_seen", False)
+
+    fast_window_active = (
+        bool(active_job_id)
+        and not first_heartbeat
+        and (now - last_run_start_ts) < 5
+    )
+
+    if fast_window_active:
+        st.session_state.fast_refresh = True
+        st_autorefresh(interval=500, key=f"fast_{episode_id}")
+        return
+
+    if active_job_id and not first_heartbeat:
+        st.session_state.first_heartbeat_seen = True
+
+    st.session_state.fast_refresh = False
+    st_autorefresh(interval=2000, key=f"steady_{episode_id}")
 
 
 def init_workspace_state():
@@ -547,18 +665,7 @@ def main():
             st.session_state.active_polling_jobs = {}
 
     # AUTO-REFRESH: Enable live progress updates while jobs are running
-    active_jobs_check = st.session_state.get("active_polling_jobs", {})
-    if active_jobs_check or st.session_state.get("active_job"):
-        # Auto-refresh every 2 seconds while jobs are running
-        import time
-        if "last_refresh_ts" not in st.session_state:
-            st.session_state.last_refresh_ts = 0
-        
-        current_ts = time.time()
-        if current_ts - st.session_state.last_refresh_ts > 2:
-            st.session_state.last_refresh_ts = current_ts
-            workspace_logger.debug(f"[AUTO-REFRESH] Active jobs: {active_jobs_check} | Triggering rerun")
-            st.rerun()
+    schedule_auto_refresh(selected_episode)
 
     # CRITICAL: Show active job status and Resume/Cancel controls
     if active_detect_job:
@@ -641,6 +748,25 @@ def main():
 
     # Log pipeline state poll
     if pipeline_state:
+        pct_raw = pipeline_state.get("pct")
+        try:
+            pct_float = float(pct_raw) if pct_raw is not None else 0.0
+        except (TypeError, ValueError):
+            pct_float = 0.0
+
+        st.session_state.progress_state = {
+            "stage": pipeline_state.get("current_step", "Full Pipeline") or "Full Pipeline",
+            "pct": max(0.0, min(pct_float, 1.0)),
+            "message": pipeline_state.get("message", ""),
+        }
+
+        heartbeat_present = any(
+            pipeline_state.get(key)
+            for key in ("heartbeat", "heartbeat_ts", "heartbeat_seq")
+        )
+        if pct_float > 0 or heartbeat_present:
+            st.session_state.first_heartbeat_seen = True
+
         workspace_logger.debug(f"[POLL] Episode={selected_episode} | stage={pipeline_state.get('current_step', 'N/A')} | pct={pipeline_state.get('pct', 0)*100 if pipeline_state.get('pct') else 'N/A'}% | status={pipeline_state.get('status', 'N/A')} | msg={pipeline_state.get('message', '')[:80]}")
 
         # Check for JSON corruption in error message
@@ -746,18 +872,20 @@ def main():
     
     if should_show_progress:
         st.markdown("---")
+        render_primary_progress(st.session_state.get("progress_state"))
+        state_view = pipeline_state or {}
 
-        current_step = pipeline_state.get("current_step", "Unknown")
-        step_index = pipeline_state.get("step_index", 0)
-        total_steps = pipeline_state.get("total_steps", 4)
-        status = pipeline_state.get("status", "unknown")
-        message = pipeline_state.get("message", "")
+        current_step = state_view.get("current_step", "Unknown")
+        step_index = state_view.get("step_index", 0)
+        total_steps = state_view.get("total_steps", 4)
+        status = state_view.get("status", "unknown")
+        message = state_view.get("message", "")
 
         if status == "error":
             st.error(f"❌ Pipeline error: {message}")
 
             with st.expander("Error details"):
-                st.json(pipeline_state)
+                st.json(state_view)
 
             # Check if error is in Stills stage
             is_stills_error = "stills" in current_step.lower() or "generate" in current_step.lower()
@@ -839,7 +967,7 @@ def main():
                     st.progress(1.0, text=f"✅ {stage_name}")
                 elif i == step_index:
                     # Current - add ETA and frames_done/frames_total if available
-                    stage_pct = pipeline_state.get("pct", 0.5)
+                    stage_pct = state_view.get("pct", 0.5)
                     if stage_pct is None:
                         stage_pct = 0.5
 
@@ -918,16 +1046,6 @@ def main():
                     # Pending
                     st.progress(0.0, text=f"⏸️ {stage_name}")
 
-            # Auto-refresh every 2 seconds
-            if "last_refresh_ts" not in st.session_state:
-                st.session_state.last_refresh_ts = 0
-
-            import time
-            current_ts = time.time()
-            if current_ts - st.session_state.last_refresh_ts > 2:
-                st.session_state.last_refresh_ts = current_ts
-                st.rerun()
-
         # Debug Console
         with st.expander("🪵 Debug Console", expanded=False):
             # TASK 4 & 5: Per-run filtering and Clear Console button
@@ -944,12 +1062,18 @@ def main():
                     st.caption("Real-time workspace debug log (last 500 lines)")
             with col_clear:
                 if st.button("Clear Console", key="clear_console_btn", help="Reset log view to current timestamp"):
-                    from datetime import datetime
                     st.session_state.last_run_ts = datetime.utcnow().isoformat()
+                    st.session_state.pop("initial_debug_view", None)
                     workspace_logger.info(f"[CONSOLE] Cleared console, reset last_run_ts to {st.session_state.last_run_ts}")
                     st.rerun()
 
-            if workspace_log_file.exists():
+            initial_lines = st.session_state.pop("initial_debug_view", None)
+            if initial_lines is not None:
+                initial_content = "".join(initial_lines)
+                if not initial_content.strip():
+                    initial_content = "⏳ Initializing debug console for this run..."
+                st.code(initial_content, language="log")
+            elif workspace_log_file.exists():
                 try:
                     with open(workspace_log_file, "r", encoding="utf-8") as f:
                         lines = f.readlines()
@@ -957,9 +1081,6 @@ def main():
 
                         # TASK 4: Filter logs to only show entries since last_run_ts
                         if st.session_state.last_run_ts:
-                            import re
-                            from datetime import datetime
-
                             filtered_lines = []
                             last_run_dt = datetime.fromisoformat(st.session_state.last_run_ts.replace('Z', '+00:00') if 'Z' in st.session_state.last_run_ts else st.session_state.last_run_ts)
 
@@ -996,17 +1117,7 @@ def main():
                         else:
                             log_content = "".join(last_500)
 
-                    st.code(log_content, language="log")
-
-                    # Auto-refresh debug console every 5s during active job
-                    if "last_debug_refresh" not in st.session_state:
-                        st.session_state.last_debug_refresh = 0
-
-                    import time
-                    current_ts = time.time()
-                    if current_ts - st.session_state.last_debug_refresh > 5:
-                        st.session_state.last_debug_refresh = current_ts
-                        st.rerun()
+                    st.code(log_content or "No debug log output yet.", language="log")
                 except Exception as e:
                     st.error(f"Could not read debug log: {e}")
             else:
@@ -1017,14 +1128,28 @@ def main():
     # Handle Prepare button click
     if st.session_state.pop("_trigger_prepare", False):
         from app.workspace.constants import STAGE_LABELS
-        from datetime import datetime
 
         workspace_logger.info(f"[UI] Clicked 'Full Pipeline' button | Episode={selected_episode}")
 
         # CRITICAL FIX: Set session state BEFORE calling backend to enable immediate UI updates
         st.session_state.active_job = f"full_{selected_episode}"
         st.session_state.last_run_ts = datetime.utcnow().isoformat()
+        st.session_state.last_run_start_ts = time.time()
         st.session_state.active_polling_jobs = {"full": f"full_{selected_episode}"}
+        st.session_state.fast_refresh = True
+        st.session_state.first_heartbeat_seen = False
+        st.session_state.progress_state = {
+            "stage": "Full Pipeline",
+            "pct": 0.0,
+            "message": "Starting Detect/Embed → Track → Cluster → Stills…",
+        }
+        st.session_state.initial_debug_view = read_recent_logs(
+            workspace_log_file,
+            selected_episode,
+            st.session_state.last_run_ts,
+            limit=100,
+        )
+        schedule_auto_refresh(selected_episode)
 
         workspace_logger.info(f"[UI] Session state updated for full pipeline start | Episode={selected_episode} | last_run_ts={st.session_state.last_run_ts}")
 
