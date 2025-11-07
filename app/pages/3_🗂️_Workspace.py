@@ -546,6 +546,20 @@ def main():
             # Clear active polling jobs if none found
             st.session_state.active_polling_jobs = {}
 
+    # AUTO-REFRESH: Enable live progress updates while jobs are running
+    active_jobs_check = st.session_state.get("active_polling_jobs", {})
+    if active_jobs_check or st.session_state.get("active_job"):
+        # Auto-refresh every 2 seconds while jobs are running
+        import time
+        if "last_refresh_ts" not in st.session_state:
+            st.session_state.last_refresh_ts = 0
+        
+        current_ts = time.time()
+        if current_ts - st.session_state.last_refresh_ts > 2:
+            st.session_state.last_refresh_ts = current_ts
+            workspace_logger.debug(f"[AUTO-REFRESH] Active jobs: {active_jobs_check} | Triggering rerun")
+            st.rerun()
+
     # CRITICAL: Show active job status and Resume/Cancel controls
     if active_detect_job:
         if detect_is_stalled:
@@ -723,7 +737,14 @@ def main():
                     with open(state_file, "w") as f:
                         json.dump(final_state, f, indent=2)
 
-    if pipeline_state and pipeline_state.get("status") not in (None, "done", "archived", "cancelled"):
+    # Check if we should show progress bars (either pipeline_state says running OR session state has active jobs)
+    should_show_progress = (
+        st.session_state.get("active_job") or 
+        st.session_state.get("active_polling_jobs") or
+        (pipeline_state and pipeline_state.get("status") not in (None, "done", "archived", "cancelled"))
+    )
+    
+    if should_show_progress:
         st.markdown("---")
 
         current_step = pipeline_state.get("current_step", "Unknown")
@@ -996,11 +1017,22 @@ def main():
     # Handle Prepare button click
     if st.session_state.pop("_trigger_prepare", False):
         from app.workspace.constants import STAGE_LABELS
+        from datetime import datetime
 
         workspace_logger.info(f"[UI] Clicked 'Full Pipeline' button | Episode={selected_episode}")
 
+        # CRITICAL FIX: Set session state BEFORE calling backend to enable immediate UI updates
+        st.session_state.active_job = f"full_{selected_episode}"
+        st.session_state.last_run_ts = datetime.utcnow().isoformat()
+        st.session_state.active_polling_jobs = {"full": f"full_{selected_episode}"}
+
+        workspace_logger.info(f"[UI] Session state updated for full pipeline start | Episode={selected_episode} | last_run_ts={st.session_state.last_run_ts}")
+
         st.info("🔄 **Starting Full Pipeline...**")
         st.write("Running: Detect/Embed → Track → Generate Face Stills")
+
+        # Show immediate feedback
+        st.toast("🚀 Full pipeline started — progress will update live", icon="✅")
 
         # Mark pipeline as starting
         from app.workspace.common import read_pipeline_state
@@ -1032,17 +1064,26 @@ def main():
             if result.get("status") == "ok":
                 st.success(f"✅ Full pipeline complete for {selected_episode}!")
                 st.info("💡 **Next steps:**\n1. Curate facebank on CAST page\n2. Click **Cluster** button")
+                workspace_logger.info(f"[UI] Full pipeline completed successfully | Episode={selected_episode}")
                 safe_rerun()
             else:
                 st.error(f"❌ Full pipeline failed: {result.get('error', 'Unknown error')}")
+                workspace_logger.error(f"[UI] Full pipeline failed | Episode={selected_episode} | Error={result.get('error', 'Unknown')}")
                 with st.expander("Error details"):
                     st.json(result)
+                # Force rerun to show error state in progress bars
+                workspace_logger.info(f"[UI] Forcing rerun to show error state")
+                st.rerun()
 
         except Exception as e:
             st.error(f"❌ Full pipeline failed: {str(e)}")
+            workspace_logger.error(f"[UI] Full pipeline exception | Episode={selected_episode} | Error={str(e)}")
             import traceback
             with st.expander("Error details"):
                 st.code(traceback.format_exc())
+            # Force rerun to show exception state
+            workspace_logger.info(f"[UI] Forcing rerun to show exception state")
+            st.rerun()
 
     # Handle Cluster button click
     if st.session_state.pop("_trigger_cluster", False):
