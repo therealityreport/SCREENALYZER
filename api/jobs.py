@@ -521,7 +521,7 @@ class JobManager:
         Creates jobs/{job_id}/meta.json with job metadata.
         Used for self-healing workers when Redis metadata expires.
 
-        Uses atomic write with flush+fsync to prevent corruption.
+        Uses atomic write with global lock to prevent corruption.
 
         Args:
             job_id: Job ID (e.g., 'prepare_RHOBH_S05_E03_11062025')
@@ -531,14 +531,10 @@ class JobManager:
         jobs_dir.mkdir(parents=True, exist_ok=True)
 
         meta_file = jobs_dir / "meta.json"
-        tmp_file = jobs_dir / "meta.json.tmp"
 
-        # Atomic write with flush+fsync
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump(envelope, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        tmp_file.replace(meta_file)
+        # Atomic write with global lock
+        from screentime.diagnostics.utils import atomic_write_json
+        atomic_write_json(meta_file, envelope)
 
     def load_job_envelope(self, job_id: str) -> Optional[dict]:
         """

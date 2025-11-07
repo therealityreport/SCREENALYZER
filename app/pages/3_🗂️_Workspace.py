@@ -584,6 +584,38 @@ def main():
     if pipeline_state:
         workspace_logger.debug(f"[POLL] Episode={selected_episode} | stage={pipeline_state.get('current_step', 'N/A')} | pct={pipeline_state.get('pct', 0)*100 if pipeline_state.get('pct') else 'N/A'}% | status={pipeline_state.get('status', 'N/A')} | msg={pipeline_state.get('message', '')[:80]}")
 
+        # Check for JSON corruption in error message
+        if pipeline_state.get("status") == "error":
+            error_msg = pipeline_state.get("message", "")
+            if "Extra data" in error_msg or "JSONDecodeError" in error_msg:
+                workspace_logger.warning(f"[UI] JSON corruption detected | Episode={selected_episode} | Error={error_msg}")
+                st.warning("⚠️ **JSON corruption detected** — auto-recovery in progress. Please wait...")
+                st.caption("The system is automatically repairing corrupted pipeline state files. This may take a few seconds.")
+
+                # Trigger automatic recovery by re-reading with safe_load_json
+                try:
+                    from screentime.diagnostics.utils import safe_load_json
+                    state_path = DATA_ROOT / "harvest" / selected_episode / "diagnostics" / "pipeline_state.json"
+                    
+                    if state_path.exists():
+                        # This will trigger automatic recovery if needed
+                        recovered_state = safe_load_json(state_path)
+                        
+                        if recovered_state:
+                            st.success("✅ Recovery successful! Pipeline state has been repaired.")
+                            workspace_logger.info(f"[UI] JSON recovery successful | Episode={selected_episode}")
+                            
+                            # Refresh to show recovered state
+                            import time
+                            time.sleep(1)
+                            st.rerun()
+                        else:
+                            st.error("❌ Recovery failed. Please check logs for details.")
+                            workspace_logger.error(f"[UI] JSON recovery failed | Episode={selected_episode}")
+                except Exception as e:
+                    st.error(f"❌ Recovery failed: {e}")
+                    workspace_logger.error(f"[UI] JSON recovery exception | Episode={selected_episode} | Error={e}")
+
     # Handle cancelled state (show toast once)
     if pipeline_state and pipeline_state.get("status") == "cancelled":
         cancelled_key = f"_pipeline_cancelled_{selected_episode}"

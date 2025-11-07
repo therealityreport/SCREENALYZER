@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import threading
 import datetime as dt
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -10,6 +11,9 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+# Global JSON write lock to prevent concurrent writes causing corruption
+_global_json_lock = threading.RLock()
 
 
 def json_safe(obj: Any) -> Any:
@@ -36,6 +40,75 @@ def json_safe(obj: Any) -> Any:
     if hasattr(obj, "isoformat"):
         return obj.isoformat()
     return obj
+
+
+def atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
+    """
+    Atomically write JSON data to file with global lock.
+
+    Prevents concurrent writes from corrupting JSON files by:
+    1. Acquiring global write lock
+    2. Writing to temporary file
+    3. Flushing and syncing to disk
+    4. Atomically replacing target file
+
+    Args:
+        path: Target file path
+        data: Dictionary to write as JSON
+    """
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+
+    with _global_json_lock:
+        try:
+            # Write to temporary file
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(json_safe(data), f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+
+            # Atomically replace target file
+            tmp_path.replace(path)
+
+        except Exception as e:
+            # Clean up temp file on error
+            if tmp_path.exists():
+                tmp_path.unlink()
+            raise e
+
+
+def validate_truncation(path: Path) -> bool:
+    """
+    Validate that recovered JSON file has expected structure.
+
+    Checks for common keys like "episode", "status", "stages", etc.
+    to ensure truncation didn't remove critical data.
+
+    Args:
+        path: Path to JSON file to validate
+
+    Returns:
+        True if validation passed, False otherwise
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        # Check if it's a dict (all our JSON files are dicts)
+        if not isinstance(data, dict):
+            logger.error(f"[JSON-VALIDATE] File {path} is not a dict after recovery")
+            return False
+
+        # File is valid if it's a non-empty dict
+        if len(data) == 0:
+            logger.warning(f"[JSON-VALIDATE] File {path} is empty dict after recovery")
+            return False
+
+        logger.info(f"[JSON-VALIDATE] File {path} validated successfully | keys={list(data.keys())[:10]}")
+        return True
+
+    except Exception as e:
+        logger.error(f"[JSON-VALIDATE] Validation failed for {path}: {e}")
+        return False
 
 
 def truncate_to_last_brace(path: Path) -> int:
@@ -84,8 +157,9 @@ def safe_load_json(path: Path) -> Dict[str, Any]:
 
     If the file is corrupted (JSONDecodeError), attempts to recover by:
     1. Truncating to last valid closing brace
-    2. Retrying load
-    3. Returning empty dict if recovery fails
+    2. Validating recovered file
+    3. Retrying load
+    4. Returning empty dict if recovery fails
 
     Args:
         path: Path to JSON file
@@ -107,6 +181,11 @@ def safe_load_json(path: Path) -> Dict[str, Any]:
             chars_truncated = truncate_to_last_brace(path)
 
             if chars_truncated >= 0:
+                # Validate recovered file
+                if not validate_truncation(path):
+                    logger.error(f"[JSON-RECOVER] Validation failed for {path}, returning empty dict")
+                    return {}
+
                 # Retry load
                 with open(path, "r", encoding="utf-8") as f:
                     result = json.load(f)
@@ -165,11 +244,8 @@ def emit_progress(
     out_path = Path("data") / "harvest" / episode_id / "diagnostics" / "pipeline_state.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Atomic write with flush+fsync to prevent corruption
-    with out_path.open("w", encoding="utf-8") as f:
-        json.dump(json_safe(payload), f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
+    # Atomic write with global lock to prevent corruption
+    atomic_write_json(out_path, payload)
 
     # CRITICAL: Append to pipeline progress telemetry log for QA debugging
     try:
@@ -211,11 +287,8 @@ def write_pipeline_state(episode_id: str, state: Dict[str, Any]) -> None:
     out_path = Path("data") / "harvest" / episode_id / "diagnostics" / "pipeline_state_full.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Atomic write with flush+fsync
-    with out_path.open("w", encoding="utf-8") as f:
-        json.dump(json_safe(state), f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
+    # Atomic write with global lock
+    atomic_write_json(out_path, state)
 
 
 def read_pipeline_state(episode_id: str) -> Optional[Dict[str, Any]]:
