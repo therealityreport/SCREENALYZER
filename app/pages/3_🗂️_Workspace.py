@@ -413,13 +413,23 @@ def main():
     with header_cols[1]:
         from app.workspace.constants import STAGE_LABELS, STAGE_HELP
 
-        # Cluster requires detection to be complete
+        # TASK 6: UX Guardrails for Cluster button
+        # Disable if: detected=false OR any active job exists
         cluster_disabled = not can_run or not artifact_status.get("detected", False)
         cluster_help = STAGE_HELP.get("cluster", "Group face tracks by identity")
+
+        # Check for active jobs
+        active_jobs_check = st.session_state.get("active_polling_jobs", {})
+        has_active_jobs = bool(active_jobs_check)
+
         if not can_run:
             cluster_help = f"Blocked: {block_reason}"
         elif not artifact_status.get("detected", False):
-            cluster_help = f"Requires {STAGE_LABELS['detect']} first"
+            cluster_help = f"Requires {STAGE_LABELS['detect']} first (detection not complete)"
+            cluster_disabled = True
+        elif has_active_jobs:
+            cluster_help = f"Active job running: {', '.join(active_jobs_check.keys())} - wait for completion"
+            cluster_disabled = True
 
         if st.button(
             STAGE_LABELS["cluster_button"],
@@ -513,6 +523,29 @@ def main():
             show_id, season_id = s_id, ss_id
             break
 
+    # TASK 2: Legacy Job ID Migration
+    # After episode is selected, check for and migrate legacy prepare_* job IDs
+    if current_ep and episode_key:
+        from episodes.runtime import migrate_legacy_job_id
+        migrated = migrate_legacy_job_id(episode_key, current_ep, DATA_ROOT)
+        if migrated:
+            st.toast("🔄 Legacy job ID migrated to detect_<EPISODE_ID>", icon="✅")
+            workspace_logger.info(f"[MIGRATION] Legacy prepare_* job migrated for {episode_key}")
+
+    # TASK 1: Auto-Polling on Page Load
+    # Check for active jobs and start polling automatically (no Resume button needed)
+    if current_ep and episode_key:
+        from episodes.runtime import get_all_active_jobs
+        active_jobs = get_all_active_jobs(episode_key, DATA_ROOT)
+
+        if active_jobs:
+            # Store active jobs in session state for polling
+            st.session_state.active_polling_jobs = active_jobs
+            workspace_logger.info(f"[AUTO-POLL] Found active jobs: {active_jobs} | Episode={episode_key}")
+        else:
+            # Clear active polling jobs if none found
+            st.session_state.active_polling_jobs = {}
+
     # CRITICAL: Show active job status and Resume/Cancel controls
     if active_detect_job:
         if detect_is_stalled:
@@ -580,6 +613,18 @@ def main():
     from app.workspace.common import read_pipeline_state
     pipeline_state = read_pipeline_state(selected_episode, DATA_ROOT)
 
+    # TASK 3: Polling Fallback
+    # If no active jobs found BUT detected=false, enable polling anyway
+    if current_ep and episode_key:
+        active_jobs_check = st.session_state.get("active_polling_jobs", {})
+        states = artifact_status if artifact_status else {}
+
+        # Enable fallback polling if no active jobs but detection is incomplete
+        if not active_jobs_check and states.get("detected") == False:
+            workspace_logger.info(f"[POLL-FALLBACK] No active jobs but detected=false, polling pipeline_state | Episode={episode_key}")
+            # Poll pipeline_state directly and attach to whatever job updates it
+            # The polling will happen naturally through the existing auto-refresh logic below
+
     # Log pipeline state poll
     if pipeline_state:
         workspace_logger.debug(f"[POLL] Episode={selected_episode} | stage={pipeline_state.get('current_step', 'N/A')} | pct={pipeline_state.get('pct', 0)*100 if pipeline_state.get('pct') else 'N/A'}% | status={pipeline_state.get('status', 'N/A')} | msg={pipeline_state.get('message', '')[:80]}")
@@ -600,9 +645,9 @@ def main():
                     if state_path.exists():
                         # This will trigger automatic recovery if needed
                         recovered_state = safe_load_json(state_path)
-                        
+
                         if recovered_state:
-                            st.success("✅ Recovery successful! Pipeline state has been repaired.")
+                            st.toast("⚠️ Pipeline prerequisites repaired (auto-recovered JSON)", icon="✅")
                             workspace_logger.info(f"[UI] JSON recovery successful | Episode={selected_episode}")
                             
                             # Refresh to show recovered state
@@ -864,14 +909,71 @@ def main():
 
         # Debug Console
         with st.expander("🪵 Debug Console", expanded=False):
-            st.caption("Real-time workspace debug log (last 500 lines)")
+            # TASK 4 & 5: Per-run filtering and Clear Console button
+            # Initialize last_run_ts in session state
+            if "last_run_ts" not in st.session_state:
+                st.session_state.last_run_ts = None
+
+            # Header row with caption and Clear Console button
+            col_caption, col_clear = st.columns([4, 1])
+            with col_caption:
+                if st.session_state.last_run_ts:
+                    st.caption(f"Logs since last run: {st.session_state.last_run_ts}")
+                else:
+                    st.caption("Real-time workspace debug log (last 500 lines)")
+            with col_clear:
+                if st.button("Clear Console", key="clear_console_btn", help="Reset log view to current timestamp"):
+                    from datetime import datetime
+                    st.session_state.last_run_ts = datetime.utcnow().isoformat()
+                    workspace_logger.info(f"[CONSOLE] Cleared console, reset last_run_ts to {st.session_state.last_run_ts}")
+                    st.rerun()
 
             if workspace_log_file.exists():
                 try:
                     with open(workspace_log_file, "r", encoding="utf-8") as f:
                         lines = f.readlines()
                         last_500 = lines[-500:] if len(lines) > 500 else lines
-                        log_content = "".join(last_500)
+
+                        # TASK 4: Filter logs to only show entries since last_run_ts
+                        if st.session_state.last_run_ts:
+                            import re
+                            from datetime import datetime
+
+                            filtered_lines = []
+                            last_run_dt = datetime.fromisoformat(st.session_state.last_run_ts.replace('Z', '+00:00') if 'Z' in st.session_state.last_run_ts else st.session_state.last_run_ts)
+
+                            for line in last_500:
+                                # Parse timestamp from log format: [YYYY-MM-DDTHH:MM:SS.ffffff] or [YYYY-MM-DD HH:MM:SS]
+                                match = re.match(r'\[(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?)\]', line)
+                                if match:
+                                    try:
+                                        timestamp_str = match.group(1).replace(' ', 'T')  # Normalize to ISO format
+                                        line_dt = datetime.fromisoformat(timestamp_str)
+                                        if line_dt >= last_run_dt:
+                                            filtered_lines.append(line)
+                                    except Exception:
+                                        # If we can't parse the timestamp, include the line
+                                        filtered_lines.append(line)
+                                else:
+                                    # No timestamp found, might be continuation line
+                                    if filtered_lines:  # Only include if we have previous filtered lines
+                                        filtered_lines.append(line)
+
+                                # Also check for [RUN-START] markers and extract ts=
+                                if "[RUN-START]" in line and "ts=" in line:
+                                    ts_match = re.search(r'ts=([\d\-T:.]+)', line)
+                                    if ts_match:
+                                        try:
+                                            run_start_ts = ts_match.group(1)
+                                            # Update session state with the most recent run start
+                                            st.session_state.last_run_ts = run_start_ts
+                                            workspace_logger.debug(f"[CONSOLE] Found RUN-START marker, updated last_run_ts to {run_start_ts}")
+                                        except Exception:
+                                            pass
+
+                            log_content = "".join(filtered_lines) if filtered_lines else "No logs since last run. Click 'Clear Console' to reset."
+                        else:
+                            log_content = "".join(last_500)
 
                     st.code(log_content, language="log")
 
