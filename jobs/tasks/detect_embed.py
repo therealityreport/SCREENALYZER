@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -28,35 +29,74 @@ logger = logging.getLogger(__name__)
 CHECKPOINT_INTERVAL_SEC = 30
 
 
-def detect_embed_task(job_id: str, episode_id: str) -> dict:
+def detect_embed_task(job_id: str | None = None, episode_id: str | None = None, episode_key: str | None = None) -> dict:
     """
     Detect faces and generate embeddings.
 
     Args:
-        job_id: Job ID
-        episode_id: Episode ID
+        job_id: Job ID (optional, will be auto-generated if not provided)
+        episode_id: Episode ID (e.g., RHOBH_S05_E01_11062025) - provide either this or episode_key
+        episode_key: Episode key (e.g., rhobh_s05_e01) - provide either this or episode_id
 
     Returns:
         Dict with detection results
     """
     from api.jobs import job_manager
 
-    # Get canonical episode key for logging and registry updates
-    episode_key = job_manager.normalize_episode_key(episode_id)
+    # CRITICAL: Log absolute paths and environment at startup for debugging
+    RUNNING_FILE = Path(__file__).resolve()
+    CWD = Path.cwd()
+    BASE_DIR = RUNNING_FILE.parents[2]  # Go up from jobs/tasks/detect_embed.py to project root
+    DATA_ROOT = BASE_DIR / "data"
 
-    logger.info(f"[DETECT] {episode_key} stage=start job_id={job_id}")
+    logger.info(f"[DETECT] ========== DETECT JOB STARTUP ==========")
+    logger.info(f"[DETECT] file={RUNNING_FILE}")
+    logger.info(f"[DETECT] cwd={CWD}")
+    logger.info(f"[DETECT] base_dir={BASE_DIR}")
+    logger.info(f"[DETECT] data_root={DATA_ROOT}")
 
-    # CRITICAL: Create dedicated detect job envelope if standalone
-    # This ensures every detect run has a persistent envelope for UI polling
-    if job_id == "manual":
-        # Standalone detect job - create dedicated envelope
+    # CRITICAL: ID Resolution - accept either episode_id or episode_key, resolve the other
+    if not episode_id and not episode_key:
+        raise ValueError("ERR_MISSING_EPISODE_ID: Must provide either episode_id or episode_key")
+
+    if episode_id and not episode_key:
+        # Normalize episode_id to episode_key
+        episode_key = job_manager.normalize_episode_key(episode_id)
+        logger.info(f"[DETECT] Resolved episode_key={episode_key} from episode_id={episode_id}")
+    elif episode_key and not episode_id:
+        # Load episode_id from registry
+        registry = job_manager.load_episode_registry(episode_key)
+        if not registry:
+            raise ValueError(f"ERR_EPISODE_NOT_FOUND: No registry found for episode_key={episode_key}")
+        episode_id = registry.get("episode_id")
+        if not episode_id:
+            raise ValueError(f"ERR_MISSING_EPISODE_ID_IN_REGISTRY: Registry for {episode_key} missing episode_id field")
+        logger.info(f"[DETECT] Resolved episode_id={episode_id} from episode_key={episode_key}")
+    else:
+        # Both provided - verify they match
+        normalized_key = job_manager.normalize_episode_key(episode_id)
+        if normalized_key != episode_key:
+            logger.warning(f"[DETECT] episode_key mismatch: provided={episode_key}, normalized={normalized_key}, using normalized")
+            episode_key = normalized_key
+
+    # CRITICAL: Always normalize job_id to detect_{episode_id} for standalone jobs
+    if not job_id or job_id == "manual":
         job_id = f"detect_{episode_id}"
-        logger.info(f"[DETECT] {episode_key} Creating standalone detect job: {job_id}")
+        logger.info(f"[DETECT] Auto-generated job_id={job_id}")
 
-    # Ensure job envelope exists
-    job_dir = Path("data/jobs") / job_id
+    # Log resolved IDs
+    logger.info(f"[DETECT] episode_id={episode_id}")
+    logger.info(f"[DETECT] episode_key={episode_key}")
+    logger.info(f"[DETECT] job_id={job_id}")
+    logger.info(f"[DETECT] stage=start")
+
+    # CRITICAL: Create job envelope with absolute paths
+    # Ensure job envelope exists at absolute path
+    job_dir = DATA_ROOT / "jobs" / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
     meta_path = job_dir / "meta.json"
+
+    logger.info(f"[DETECT] envelope_path={meta_path} (absolute)")
 
     if not meta_path.exists():
         # Create new envelope
@@ -67,16 +107,16 @@ def detect_embed_task(job_id: str, episode_id: str) -> dict:
             "mode": "detect",
             "created_at": datetime.utcnow().isoformat(),
             "stages": {"detect": {"status": "running"}},
-            "registry_path": f"data/episodes/{episode_key}/state.json",
+            "registry_path": str(DATA_ROOT / "episodes" / episode_key / "state.json"),
         }
         with open(meta_path, "w") as f:
             json.dump(envelope, f, indent=2)
-        logger.info(f"[DETECT] {episode_key} Created job envelope: {meta_path}")
+        logger.info(f"[DETECT] {episode_key} Created job envelope at {meta_path}")
     else:
         # Load existing envelope
         with open(meta_path) as f:
             envelope = json.load(f)
-        logger.info(f"[DETECT] {episode_key} Loaded existing envelope: {meta_path}")
+        logger.info(f"[DETECT] {episode_key} Loaded existing envelope from {meta_path}")
 
     # Mark stage as running in envelope (for UI polling)
     try:
@@ -97,19 +137,19 @@ def detect_embed_task(job_id: str, episode_id: str) -> dict:
     except Exception as e:
         logger.warning(f"[DETECT] {episode_key} Could not update registry: {e}")
 
-    # Load config
-    config_path = Path("configs/pipeline.yaml")
+    # Load config - use absolute path
+    config_path = BASE_DIR / "configs" / "pipeline.yaml"
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
-    # Setup paths - use episode_id for physical directories
-    harvest_dir = Path("data/harvest") / episode_id
+    # Setup paths - use episode_id for physical directories with absolute paths
+    harvest_dir = DATA_ROOT / "harvest" / episode_id
     manifest_path = harvest_dir / "manifest.parquet"
 
     # Create detect artifact directory
     detect_dir = harvest_dir / "detect"
     detect_dir.mkdir(parents=True, exist_ok=True)
-    logger.info(f"[DETECT] {episode_key} Artifact directory: {detect_dir}")
+    logger.info(f"[DETECT] artifacts_dir={detect_dir} (absolute)")
 
     if not manifest_path.exists():
         raise ValueError(f"Manifest not found: {manifest_path}")
@@ -227,33 +267,99 @@ def detect_embed_task(job_id: str, episode_id: str) -> dict:
     # Get embedding config
     embedding_cfg = config["embedding"]
 
-    # Load models with timing
-    model_start = time.time()
-    logger.info(f"[DETECT] {episode_key} model=retinaface loading...")
-
-    detector = RetinaFaceDetector(
-        min_face_px=min_face_px,
-        min_confidence=min_confidence,
-        provider_order=provider_order,
+    # CRITICAL: Heartbeat during model init to prevent "stuck" detection
+    # Write heartbeat before loading models
+    from screentime.diagnostics.utils import emit_progress
+    emit_progress(
+        episode_id=episode_id,
+        step="1. RetinaFace + ArcFace (Detect & Embed)",
+        step_index=1,
+        total_steps=5,
+        status="running",
+        message="Loading RetinaFace detection model...",
+        pct=0.0,
     )
+    logger.info(f"[DETECT] {episode_key} heartbeat=model_init_start")
 
-    detector_time = time.time() - model_start
-    logger.info(f"[DETECT] {episode_key} model=retinaface loaded in {detector_time:.1f}s provider={detector.get_provider_info()}")
+    # Load models with timing and provider fallback
+    model_start = time.time()
+    logger.info(f"[DETECT] {episode_key} model=retinaface loading provider_order={provider_order}...")
+
+    # Provider fallback: try in order, log chosen provider
+    detector = None
+    detector_error = None
+    for i, provider in enumerate(provider_order):
+        try:
+            logger.info(f"[DETECT] {episode_key} Attempting RetinaFace with provider={provider}")
+            detector = RetinaFaceDetector(
+                min_face_px=min_face_px,
+                min_confidence=min_confidence,
+                provider_order=[provider],  # Try one at a time
+            )
+            detector_time = time.time() - model_start
+            provider_info = detector.get_provider_info()
+            logger.info(f"[DETECT] {episode_key} model=retinaface loaded in {detector_time:.1f}s provider={provider_info}")
+
+            # Write heartbeat after successful detector load
+            emit_progress(
+                episode_id=episode_id,
+                step="1. RetinaFace + ArcFace (Detect & Embed)",
+                step_index=1,
+                total_steps=5,
+                status="running",
+                message=f"RetinaFace loaded ({provider_info}), loading ArcFace...",
+                pct=0.1,
+            )
+            logger.info(f"[DETECT] {episode_key} heartbeat=detector_loaded provider={provider_info}")
+            break  # Success!
+        except Exception as e:
+            detector_error = e
+            logger.warning(f"[DETECT] {episode_key} RetinaFace failed with provider={provider}: {e}")
+            if i == len(provider_order) - 1:
+                # Last provider failed
+                logger.error(f"[DETECT] {episode_key} ERR_DETECT_INIT_TIMEOUT: All providers failed for RetinaFace")
+                raise ValueError(f"ERR_DETECT_INIT_TIMEOUT: RetinaFace failed with all providers {provider_order}: {detector_error}")
 
     embedder_start = time.time()
-    logger.info(f"[DETECT] {episode_key} model=arcface loading...")
+    logger.info(f"[DETECT] {episode_key} model=arcface loading provider_order={provider_order}...")
 
-    embedder = ArcFaceEmbedder(
-        provider_order=provider_order,
-        skip_redetect=embedding_cfg.get("skip_redetect", False),
-        align_priority=embedding_cfg.get("align_priority", "kps_then_bbox"),
-        margin_scale=embedding_cfg.get("margin_scale", 1.25),
-        min_chip_px=embedding_cfg.get("min_chip_px", 112),
-        fallback_scales=embedding_cfg.get("fallback_scales", [1.0, 1.2, 1.4]),
-    )
+    # Provider fallback for embedder
+    embedder = None
+    embedder_error = None
+    for i, provider in enumerate(provider_order):
+        try:
+            logger.info(f"[DETECT] {episode_key} Attempting ArcFace with provider={provider}")
+            embedder = ArcFaceEmbedder(
+                provider_order=[provider],  # Try one at a time
+                skip_redetect=embedding_cfg.get("skip_redetect", False),
+                align_priority=embedding_cfg.get("align_priority", "kps_then_bbox"),
+                margin_scale=embedding_cfg.get("margin_scale", 1.25),
+                min_chip_px=embedding_cfg.get("min_chip_px", 112),
+                fallback_scales=embedding_cfg.get("fallback_scales", [1.0, 1.2, 1.4]),
+            )
+            embedder_time = time.time() - embedder_start
+            provider_info = embedder.get_provider_info()
+            logger.info(f"[DETECT] {episode_key} model=arcface loaded in {embedder_time:.1f}s provider={provider_info}")
 
-    embedder_time = time.time() - embedder_start
-    logger.info(f"[DETECT] {episode_key} model=arcface loaded in {embedder_time:.1f}s provider={embedder.get_provider_info()}")
+            # Write heartbeat after successful embedder load
+            emit_progress(
+                episode_id=episode_id,
+                step="1. RetinaFace + ArcFace (Detect & Embed)",
+                step_index=1,
+                total_steps=5,
+                status="running",
+                message=f"Models loaded, processing frames...",
+                pct=0.2,
+            )
+            logger.info(f"[DETECT] {episode_key} heartbeat=models_ready detector={detector.get_provider_info()} embedder={provider_info}")
+            break  # Success!
+        except Exception as e:
+            embedder_error = e
+            logger.warning(f"[DETECT] {episode_key} ArcFace failed with provider={provider}: {e}")
+            if i == len(provider_order) - 1:
+                # Last provider failed
+                logger.error(f"[DETECT] {episode_key} ERR_DETECT_INIT_TIMEOUT: All providers failed for ArcFace")
+                raise ValueError(f"ERR_DETECT_INIT_TIMEOUT: ArcFace failed with all providers {provider_order}: {embedder_error}")
 
     # Open video
     cap = cv2.VideoCapture(video_path)
@@ -347,7 +453,7 @@ def detect_embed_task(job_id: str, episode_id: str) -> dict:
 
             processed_frames += 1
 
-            # Checkpoint every 5 minutes
+            # Checkpoint every 30 seconds
             if time.time() - last_checkpoint_time > CHECKPOINT_INTERVAL_SEC:
                 _save_checkpoint(
                     harvest_dir,
@@ -362,12 +468,45 @@ def detect_embed_task(job_id: str, episode_id: str) -> dict:
                 )
                 last_checkpoint_time = time.time()
 
-                # Update job progress - for all job workflows
-                progress_pct = (processed_frames / len(manifest_df)) * 100
+                # CRITICAL: Update progress for ALL jobs (including standalone detect)
+                total_frames = len(manifest_df)
+                progress_pct = (processed_frames / total_frames) * 100
+
+                # Update job manager progress (for prepare jobs)
                 if not job_id.startswith("detect_"):
-                    # Only update progress for prepare jobs (detect jobs are standalone)
                     from api.jobs import job_manager
                     job_manager.update_job_progress(job_id, "detect_embed", progress_pct)
+
+                # CRITICAL: Update envelope with frames_done/frames_total for ALL jobs
+                try:
+                    from api.jobs import job_manager
+                    # Scale progress_pct to 0.2-0.9 range (models loaded at 0.2, final save at 0.9)
+                    scaled_pct = 0.2 + (progress_pct / 100.0) * 0.7
+                    job_manager.update_stage_status(
+                        job_id,
+                        "detect",
+                        "running",
+                        result={
+                            "frames_done": processed_frames,
+                            "frames_total": total_frames,
+                            "faces_detected": detection_stats["faces_detected"],
+                            "updated_at": datetime.utcnow().isoformat(),
+                        },
+                    )
+
+                    # CRITICAL: Update pipeline_state.json for UI polling
+                    emit_progress(
+                        episode_id=episode_id,
+                        step="1. RetinaFace + ArcFace (Detect & Embed)",
+                        step_index=1,
+                        total_steps=5,
+                        status="running",
+                        message=f"Processing frames: {processed_frames}/{total_frames} ({progress_pct:.1f}%) • {detection_stats['faces_detected']} faces detected",
+                        pct=scaled_pct,
+                    )
+                    logger.info(f"[DETECT] {episode_key} heartbeat=processing frames={processed_frames}/{total_frames} pct={progress_pct:.1f}% faces={detection_stats['faces_detected']}")
+                except Exception as e:
+                    logger.warning(f"[DETECT] {episode_key} Could not update progress: {e}")
 
                 # Telemetry
                 telemetry.log(
@@ -520,6 +659,33 @@ def detect_embed_task(job_id: str, episode_id: str) -> dict:
             logger.error(f"[DETECT] {episode_key} ERR_REGISTRY_UPDATE_FAILED: {e}")
             raise ValueError(f"ERR_REGISTRY_UPDATE_FAILED: Could not update registry for {episode_key}: {e}")
 
+        # CRITICAL: Add "done": true marker to meta.json for trivial polling
+        try:
+            with open(meta_path, "r") as f:
+                envelope = json.load(f)
+            envelope["done"] = True
+            envelope["completed_at"] = datetime.utcnow().isoformat()
+            with open(meta_path, "w") as f:
+                json.dump(envelope, f, indent=2)
+            logger.info(f"[DETECT] {episode_key} marked envelope as done")
+        except Exception as e:
+            logger.error(f"[DETECT] {episode_key} Could not mark envelope as done: {e}")
+
+        # CRITICAL: Emit final progress to pipeline_state.json
+        try:
+            emit_progress(
+                episode_id=episode_id,
+                step="1. RetinaFace + ArcFace (Detect & Embed)",
+                step_index=1,
+                total_steps=5,
+                status="ok",
+                message=f"Complete! {detection_stats['faces_detected']} faces detected, {detection_stats['embeddings_computed']} embeddings computed",
+                pct=1.0,
+            )
+            logger.info(f"[DETECT] {episode_key} pipeline_state=ok")
+        except Exception as e:
+            logger.warning(f"[DETECT] {episode_key} Could not emit final progress: {e}")
+
         # Enqueue next stage (tracking) - only for prepare jobs, not standalone detect
         if not job_id.startswith("detect_"):  # Only enqueue tracking for prepare jobs
             job_manager.tracking_queue.enqueue(
@@ -542,15 +708,31 @@ def detect_embed_task(job_id: str, episode_id: str) -> dict:
 
     except Exception as e:
         # CRITICAL: Update envelope and registry on FAILURE
-        logger.error(f"[DETECT] {episode_key} stage=end status=error error={str(e)}")
+        error_message = str(e)
+        logger.error(f"[DETECT] {episode_key} stage=end status=error error={error_message}")
 
         # Mark stage as error in envelope
         if True:  # Always update envelope for all job types
             try:
-                job_manager.update_stage_status(job_id, "detect", "error", error=str(e))
+                job_manager.update_stage_status(job_id, "detect", "error", error=error_message)
                 logger.info(f"[DETECT] {episode_key} envelope stage=error")
             except Exception as env_err:
                 logger.error(f"[DETECT] {episode_key} Could not update envelope with error: {env_err}")
+
+        # CRITICAL: Emit error progress to pipeline_state.json
+        try:
+            emit_progress(
+                episode_id=episode_id,
+                step="1. RetinaFace + ArcFace (Detect & Embed)",
+                step_index=1,
+                total_steps=5,
+                status="error",
+                message=f"Error: {error_message[:200]}",  # Truncate long errors
+                pct=0.0,
+            )
+            logger.info(f"[DETECT] {episode_key} pipeline_state=error")
+        except Exception as emit_err:
+            logger.warning(f"[DETECT] {episode_key} Could not emit error progress: {emit_err}")
 
         # Re-raise to propagate error
         raise
