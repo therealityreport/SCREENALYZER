@@ -38,7 +38,7 @@ def json_safe(obj: Any) -> Any:
     return obj
 
 
-def truncate_to_last_brace(path: Path) -> None:
+def truncate_to_last_brace(path: Path) -> int:
     """
     Truncate corrupted JSON file to last valid closing brace.
 
@@ -47,17 +47,21 @@ def truncate_to_last_brace(path: Path) -> None:
 
     Args:
         path: Path to corrupted JSON file
+
+    Returns:
+        Number of bytes truncated, or -1 if recovery failed
     """
     try:
         with open(path, "r+b") as f:
             content = f.read()
+            original_size = len(content)
 
             # Find last occurrence of '}'
             last_brace = content.rfind(b'}')
 
             if last_brace == -1:
-                logger.error(f"No closing brace found in {path}, cannot recover")
-                return
+                logger.error(f"[JSON-RECOVER] No closing brace found in {path}, cannot recover")
+                return -1
 
             # Truncate to last brace + 1
             f.seek(0)
@@ -66,9 +70,12 @@ def truncate_to_last_brace(path: Path) -> None:
             f.flush()
             os.fsync(f.fileno())
 
-        logger.info(f"Truncated {path} to last valid brace at byte {last_brace}")
+        chars_truncated = original_size - (last_brace + 1)
+        logger.warning(f"[JSON-RECOVER] Healed {path} | chars_truncated={chars_truncated} | original_size={original_size} | final_size={last_brace + 1}")
+        return chars_truncated
     except Exception as e:
-        logger.error(f"Failed to truncate {path}: {e}")
+        logger.error(f"[JSON-RECOVER] Failed to truncate {path}: {e}")
+        return -1
 
 
 def safe_load_json(path: Path) -> Dict[str, Any]:
@@ -93,20 +100,26 @@ def safe_load_json(path: Path) -> Dict[str, Any]:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except json.JSONDecodeError as e:
-        logger.error(f"Malformed JSON in {path}: {e}")
+        logger.error(f"[JSON-ERROR] Malformed JSON in {path}: {e}")
 
         # Attempt recovery
         try:
-            truncate_to_last_brace(path)
+            chars_truncated = truncate_to_last_brace(path)
 
-            # Retry load
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
+            if chars_truncated >= 0:
+                # Retry load
+                with open(path, "r", encoding="utf-8") as f:
+                    result = json.load(f)
+                logger.info(f"[JSON-RECOVER] Successfully recovered {path} after truncating {chars_truncated} bytes")
+                return result
+            else:
+                logger.error(f"[JSON-RECOVER] Could not recover {path}, returning empty dict")
+                return {}
         except Exception as recovery_error:
-            logger.error(f"Failed to recover {path}: {recovery_error}")
+            logger.error(f"[JSON-RECOVER] Failed to recover {path}: {recovery_error}", exc_info=True)
             return {}
     except Exception as e:
-        logger.error(f"Failed to load {path}: {e}")
+        logger.error(f"[JSON-ERROR] Failed to load {path}: {e}", exc_info=True)
         return {}
 
 
@@ -157,6 +170,40 @@ def emit_progress(
         json.dump(json_safe(payload), f, indent=2)
         f.flush()
         os.fsync(f.fileno())
+
+    # CRITICAL: Append to pipeline progress telemetry log for QA debugging
+    try:
+        telemetry_dir = Path("logs")
+        telemetry_dir.mkdir(parents=True, exist_ok=True)
+        telemetry_log = telemetry_dir / "pipeline_progress.log"
+
+        # Extract metrics from extra
+        metrics_str = ""
+        if extra:
+            frames_done = extra.get("frames_done")
+            frames_total = extra.get("frames_total")
+            faces_detected = extra.get("faces_detected")
+            tracks_active = extra.get("tracks_active")
+            clusters_built = extra.get("clusters_built")
+
+            if frames_done is not None and frames_total is not None:
+                metrics_str = f" frames={frames_done}/{frames_total}"
+            if faces_detected is not None:
+                metrics_str += f" faces={faces_detected}"
+            if tracks_active is not None:
+                metrics_str += f" tracks={tracks_active}"
+            if clusters_built is not None:
+                metrics_str += f" clusters={clusters_built}"
+
+        # Format: [timestamp] episode stage pct% message metrics
+        pct_str = f"{pct*100:.1f}%" if pct is not None else "N/A"
+        log_line = f"[{dt.datetime.utcnow().isoformat()}] {episode_id} {step} {pct_str} {status} | {message}{metrics_str}\n"
+
+        with telemetry_log.open("a", encoding="utf-8") as f:
+            f.write(log_line)
+            f.flush()
+    except Exception as e:
+        logger.warning(f"Failed to write pipeline telemetry: {e}")
 
 
 def write_pipeline_state(episode_id: str, state: Dict[str, Any]) -> None:

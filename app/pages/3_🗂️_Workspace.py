@@ -6,6 +6,7 @@ cluster_metrics and track_metrics.
 """
 
 import json
+import logging
 import sys
 from pathlib import Path
 
@@ -28,6 +29,31 @@ from app.components.episode_manager_modal import episode_manager_modal
 from app.workspace.faces import render_faces_tab
 from app.workspace.clusters import render_clusters_tab
 from app.workspace.tracks import render_tracks_tab
+
+# Configure workspace debug logging
+workspace_logger = logging.getLogger("workspace_ui")
+workspace_logger.setLevel(logging.DEBUG)
+
+# Add file handler for workspace debug log
+log_dir = Path("logs")
+log_dir.mkdir(parents=True, exist_ok=True)
+workspace_log_file = log_dir / "workspace_debug.log"
+
+if not any(isinstance(h, logging.FileHandler) for h in workspace_logger.handlers):
+    file_handler = logging.FileHandler(workspace_log_file, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(
+        '[%(asctime)s] %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    ))
+    workspace_logger.addHandler(file_handler)
+
+# Also add console handler
+if not any(isinstance(h, logging.StreamHandler) for h in workspace_logger.handlers):
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(logging.Formatter('[%(levelname)s] %(message)s'))
+    workspace_logger.addHandler(console_handler)
 from app.workspace.review import render_review_tab
 from app.utils.ui_keys import safe_rerun
 from app.lib.registry import (
@@ -511,6 +537,8 @@ def main():
 
     # Handle Resume button click
     if st.session_state.pop("_resume_detect", None):
+        workspace_logger.info(f"[UI] Clicked 'Resume Detect' button | Episode={episode_key} | job_id={active_detect_job}")
+
         st.info("🔄 **Resuming Detect job...**")
         st.write(f"Reattaching to job: {active_detect_job}")
         st.caption("The progress polling will now track this job automatically.")
@@ -521,6 +549,8 @@ def main():
 
     # Handle Cancel button click
     if st.session_state.pop("_cancel_detect", None):
+        workspace_logger.info(f"[UI] Clicked 'Cancel Detect' button | Episode={episode_key} | job_id={active_detect_job}")
+
         st.warning("❌ **Canceling Detect job...**")
 
         from episodes.runtime import clear_active_job
@@ -538,14 +568,21 @@ def main():
             if lock_path.exists():
                 lock_path.unlink()
 
+            workspace_logger.info(f"[UI] Successfully canceled Detect job | Episode={episode_key} | job_id={active_detect_job}")
+
             st.success("✅ Detect job canceled. You can start a new run.")
             st.rerun()
         except Exception as e:
+            workspace_logger.error(f"[UI] Failed to cancel Detect job | Episode={episode_key} | job_id={active_detect_job} | Error={e}")
             st.error(f"Failed to cancel: {e}")
 
     # Progress polling UI
     from app.workspace.common import read_pipeline_state
     pipeline_state = read_pipeline_state(selected_episode, DATA_ROOT)
+
+    # Log pipeline state poll
+    if pipeline_state:
+        workspace_logger.debug(f"[POLL] Episode={selected_episode} | stage={pipeline_state.get('current_step', 'N/A')} | pct={pipeline_state.get('pct', 0)*100 if pipeline_state.get('pct') else 'N/A'}% | status={pipeline_state.get('status', 'N/A')} | msg={pipeline_state.get('message', '')[:80]}")
 
     # Handle cancelled state (show toast once)
     if pipeline_state and pipeline_state.get("status") == "cancelled":
@@ -793,11 +830,40 @@ def main():
                 st.session_state.last_refresh_ts = current_ts
                 st.rerun()
 
+        # Debug Console
+        with st.expander("🪵 Debug Console", expanded=False):
+            st.caption("Real-time workspace debug log (last 500 lines)")
+
+            if workspace_log_file.exists():
+                try:
+                    with open(workspace_log_file, "r", encoding="utf-8") as f:
+                        lines = f.readlines()
+                        last_500 = lines[-500:] if len(lines) > 500 else lines
+                        log_content = "".join(last_500)
+
+                    st.code(log_content, language="log")
+
+                    # Auto-refresh debug console every 5s during active job
+                    if "last_debug_refresh" not in st.session_state:
+                        st.session_state.last_debug_refresh = 0
+
+                    import time
+                    current_ts = time.time()
+                    if current_ts - st.session_state.last_debug_refresh > 5:
+                        st.session_state.last_debug_refresh = current_ts
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Could not read debug log: {e}")
+            else:
+                st.info("No debug log available yet. Debug events will appear here during pipeline runs.")
+
         st.markdown("---")
 
     # Handle Prepare button click
     if st.session_state.pop("_trigger_prepare", False):
         from app.workspace.constants import STAGE_LABELS
+
+        workspace_logger.info(f"[UI] Clicked 'Full Pipeline' button | Episode={selected_episode}")
 
         st.info("🔄 **Starting Full Pipeline...**")
         st.write("Running: Detect/Embed → Track → Generate Face Stills")
@@ -846,6 +912,8 @@ def main():
 
     # Handle Cluster button click
     if st.session_state.pop("_trigger_cluster", False):
+        workspace_logger.info(f"[UI] Clicked 'Cluster' button | Episode={selected_episode}")
+
         st.info("🎯 **Starting Cluster pipeline...**")
         st.write("Grouping face tracks by identity using current facebank")
         st.caption("(Missing stages will auto-run: Detect → Track → Cluster)")
@@ -893,6 +961,8 @@ def main():
 
     # Handle Analyze button click
     if st.session_state.pop("_trigger_analyze", False):
+        workspace_logger.info(f"[UI] Clicked 'Analytics' button | Episode={selected_episode}")
+
         st.info("📊 **Starting Analytics pipeline...**")
         st.write("Generating timeline & totals from final cluster labels")
 
