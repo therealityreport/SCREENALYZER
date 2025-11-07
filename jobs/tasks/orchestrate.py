@@ -399,33 +399,33 @@ def orchestrate_prepare(
     # Update final state
     results["final_state"] = check_artifacts(episode_id, data_root)
 
-    # Mark episode as prepared
+    # Mark pipeline stages complete in pipeline_state.json
     mark_prepared(episode_id, data_root)
-    results["prepared"] = True
+    results["pipeline_complete"] = True
 
     # Emit final "done" progress
     last_result = results.get("stages", {}).get("stills", {}).get("result", {})
     emit_progress(
         episode_id=episode_id,
-        step="Prepare Complete",
+        step="Pipeline Complete",
         step_index=total_steps,
         total_steps=total_steps,
         status="done",
-        message="Tracks & Stills ready → Curate facebank, then Cluster",
-        extra={"result": last_result, "prepared": True},
+        message="Detection, tracking, and stills complete → Curate facebank, then cluster",
+        extra={"result": last_result, "pipeline_complete": True},
     )
 
     if progress_callback:
         progress_callback({
-            "step": "Prepare Complete",
+            "step": "Pipeline Complete",
             "step_index": total_steps,
             "total_steps": total_steps,
             "status": "done",
-            "prepared": True,
+            "pipeline_complete": True,
         })
 
     _save_state(state_file, results)
-    logger.info(f"[{job_id}] Prepare complete: {results['final_state']}")
+    logger.info(f"[{job_id}] Full pipeline complete: {results['final_state']}")
     return results
 
 
@@ -453,16 +453,41 @@ def orchestrate_cluster_only(
     if job_id is None:
         job_id = f"cluster_{episode_id}"
 
-    # Check if prepared
+    # Check if detection and tracking are complete - auto-run if missing
     if not is_prepared(episode_id, data_root):
-        error_msg = "Episode not prepared. Run Prepare Tracks & Stills first."
-        logger.error(f"[{job_id}] {error_msg}")
-        return {
-            "episode_id": episode_id,
-            "job_id": job_id,
-            "status": "error",
-            "error": error_msg,
-        }
+        logger.warning(f"[{job_id}] Prerequisites missing (detect/track); auto-running dependencies first.")
+
+        # Auto-trigger full pipeline to ensure detect → track → stills are complete
+        try:
+            logger.info(f"[{job_id}] Auto-running full pipeline before cluster...")
+            prep_result = orchestrate_prepare(
+                episode_id=episode_id,
+                data_root=data_root,
+                force=False,  # Skip completed stages
+                resume=True,
+                progress_callback=progress_callback,
+            )
+
+            if prep_result.get("status") != "ok":
+                error_msg = f"Auto-run of prerequisites failed: {prep_result.get('error', 'Unknown error')}"
+                logger.error(f"[{job_id}] {error_msg}")
+                return {
+                    "episode_id": episode_id,
+                    "job_id": job_id,
+                    "status": "error",
+                    "error": error_msg,
+                }
+
+            logger.info(f"[{job_id}] Prerequisites complete, proceeding to cluster...")
+        except Exception as e:
+            error_msg = f"Auto-run of prerequisites failed: {str(e)}"
+            logger.error(f"[{job_id}] {error_msg}")
+            return {
+                "episode_id": episode_id,
+                "job_id": job_id,
+                "status": "error",
+                "error": error_msg,
+            }
 
     harvest_dir = data_root / "harvest" / episode_id
     diagnostics_dir = harvest_dir / "diagnostics"

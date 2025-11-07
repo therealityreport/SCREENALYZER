@@ -276,6 +276,20 @@ def main():
     can_run = pipeline_check.get("can_run", True)
     block_reason = pipeline_check.get("reason", "")
 
+    # CRITICAL: Check for active detect job (for resume/cancel functionality)
+    active_detect_job = None
+    detect_is_stalled = False
+    episode_key = None
+    if current_ep:
+        from api.jobs import job_manager
+        episode_key = job_manager.normalize_episode_key(current_ep)
+
+        from episodes.runtime import get_active_job, check_job_stalled
+        active_detect_job = get_active_job(episode_key, "detect", DATA_ROOT)
+
+        if active_detect_job:
+            detect_is_stalled = check_job_stalled(active_detect_job, DATA_ROOT)
+
     # Phase 3 P1: Check extraction status from episode registry
     extraction_ready = False
     episode_state = None
@@ -314,20 +328,30 @@ def main():
                     st.rerun()
 
     with header_cols[0]:
+        from app.workspace.constants import STAGE_LABELS, STAGE_HELP
+
         # Phase 3 P1: Conditional Prepare based on extraction status
         if extraction_ready:
-            # Frames ready - show manual prepare for re-running detection
-            prepare_help = "Re-run detection and tracking (frames already extracted)"
-            if not can_run:
+            # Frames ready - show full pipeline button
+            prepare_help = STAGE_LABELS.get("full_pipeline", "Run full pipeline: detect → embed → track → cluster")
+            prepare_disabled = not can_run
+
+            # Disable if active job exists and is not stalled
+            if active_detect_job and not detect_is_stalled:
+                prepare_disabled = True
+                prepare_help = f"Detect job already running: {active_detect_job}"
+            elif active_detect_job and detect_is_stalled:
+                prepare_help = "Detect job stalled. Use Resume or Cancel buttons below."
+            elif not can_run:
                 prepare_help = f"Blocked: {block_reason}"
 
             if st.button(
-                "🔄 Prepare Tracks & Stills",
-                type="secondary",
+                STAGE_LABELS["full_pipeline"],
+                type="primary",
                 help=prepare_help,
                 key="workspace_prepare_btn",
                 use_container_width=True,
-                disabled=not can_run,
+                disabled=prepare_disabled,
             ):
                 st.session_state["_trigger_prepare"] = True
         else:
@@ -361,15 +385,18 @@ def main():
 
 
     with header_cols[1]:
-        cluster_disabled = not can_run or not artifact_status["prepared"]
-        cluster_help = "Cluster prepared tracks against current facebank"
+        from app.workspace.constants import STAGE_LABELS, STAGE_HELP
+
+        # Cluster requires detection to be complete
+        cluster_disabled = not can_run or not artifact_status.get("detected", False)
+        cluster_help = STAGE_HELP.get("cluster", "Group face tracks by identity")
         if not can_run:
             cluster_help = f"Blocked: {block_reason}"
-        elif not artifact_status["prepared"]:
-            cluster_help = "Requires preparation first"
-        
+        elif not artifact_status.get("detected", False):
+            cluster_help = f"Requires {STAGE_LABELS['detect']} first"
+
         if st.button(
-            "🎯 Cluster",
+            STAGE_LABELS["cluster_button"],
             help=cluster_help,
             key="workspace_cluster_btn",
             use_container_width=True,
@@ -378,15 +405,17 @@ def main():
             st.session_state["_trigger_cluster"] = True
 
     with header_cols[2]:
+        from app.workspace.constants import STAGE_LABELS, STAGE_HELP
+
         analyze_disabled = not can_run or not artifact_status["has_clusters"]
-        analyze_help = "Generate timeline & totals from clusters"
+        analyze_help = STAGE_HELP.get("analytics", "Compute per-person screen time from labeled clusters")
         if not can_run:
             analyze_help = f"Blocked: {block_reason}"
         elif not artifact_status["has_clusters"]:
             analyze_help = "Requires clustering first"
-        
+
         if st.button(
-            "📊 Analyze",
+            STAGE_LABELS["analytics_button"],
             help=analyze_help,
             key="workspace_analyze_btn",
             use_container_width=True,
@@ -457,6 +486,62 @@ def main():
         if ep_id == selected_episode:
             show_id, season_id = s_id, ss_id
             break
+
+    # CRITICAL: Show active job status and Resume/Cancel controls
+    if active_detect_job:
+        if detect_is_stalled:
+            st.warning(f"⚠️ Detect job appears stalled (no heartbeat >30s): {active_detect_job}")
+            st.caption("The job may have crashed or the worker may be stuck. Use Resume to reattach or Cancel to clear.")
+        else:
+            st.info(f"ℹ️ Detect job active: {active_detect_job}")
+            st.caption("This job is currently running. Progress will update automatically.")
+
+        # Resume/Cancel buttons
+        col1, col2 = st.columns(2)
+
+        with col1:
+            if st.button("🔄 Resume Detect", key="resume_detect", help="Reattach to running job", use_container_width=True):
+                st.session_state["_resume_detect"] = active_detect_job
+                st.rerun()
+
+        with col2:
+            if st.button("❌ Cancel Detect", key="cancel_detect", help="Cancel and clear job", use_container_width=True):
+                st.session_state["_cancel_detect"] = active_detect_job
+                st.rerun()
+
+    # Handle Resume button click
+    if st.session_state.pop("_resume_detect", None):
+        st.info("🔄 **Resuming Detect job...**")
+        st.write(f"Reattaching to job: {active_detect_job}")
+        st.caption("The progress polling will now track this job automatically.")
+        st.success("✅ Resumed! Polling for progress...")
+        import time
+        time.sleep(1)
+        st.rerun()
+
+    # Handle Cancel button click
+    if st.session_state.pop("_cancel_detect", None):
+        st.warning("❌ **Canceling Detect job...**")
+
+        from episodes.runtime import clear_active_job
+        from api.jobs import job_manager
+
+        try:
+            # Mark job as canceled in envelope
+            job_manager.update_stage_status(active_detect_job, "detect", "canceled")
+
+            # Clear from runtime
+            clear_active_job(episode_key, "detect", DATA_ROOT)
+
+            # Remove lock file if exists
+            lock_path = DATA_ROOT / "jobs" / active_detect_job / ".lock"
+            if lock_path.exists():
+                lock_path.unlink()
+
+            st.success("✅ Detect job canceled. You can start a new run.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Failed to cancel: {e}")
 
     # Progress polling UI
     from app.workspace.common import read_pipeline_state
@@ -609,7 +694,7 @@ def main():
                 st.caption(message)
 
             # Per-stage progress bars
-            stages = ["Detect/Embed", "Track", "Cluster", "Generate Stills", "Analytics"]
+            stages = ["1. RetinaFace + ArcFace (Detect & Embed)", "2. ByteTrack (Track Faces)", "3. Agglomerative Clustering (Group Tracks)", "4. Generate Stills", "5. Screenalyzer Analytics"]
             # Map display names to step keys used in stats
             step_keys = ["detect", "track", "cluster", "stills", "analytics"]
 
@@ -676,8 +761,10 @@ def main():
 
     # Handle Prepare button click
     if st.session_state.pop("_trigger_prepare", False):
-        st.info("🔄 **Starting Prepare pipeline...**")
-        st.write("Running Detect/Embed → Track → Generate Face Stills")
+        from app.workspace.constants import STAGE_LABELS
+
+        st.info("🔄 **Starting Full Pipeline...**")
+        st.write("Running: Detect/Embed → Track → Generate Face Stills")
 
         # Mark pipeline as starting
         from app.workspace.common import read_pipeline_state
@@ -692,13 +779,13 @@ def main():
                 "step_index": 0,
                 "total_steps": 4,
                 "status": "running",
-                "message": "Initializing Prepare pipeline...",
+                "message": "Initializing full pipeline (detect → track → stills)...",
             }, f, indent=2)
 
         try:
             from jobs.tasks.orchestrate import orchestrate_prepare
 
-            with st.spinner("Running Prepare pipeline... This may take several minutes."):
+            with st.spinner("Running full pipeline... This may take several minutes."):
                 result = orchestrate_prepare(
                     episode_id=selected_episode,
                     data_root=DATA_ROOT,
@@ -707,16 +794,16 @@ def main():
                 )
 
             if result.get("status") == "ok":
-                st.success(f"✅ Prepare complete for {selected_episode}!")
+                st.success(f"✅ Full pipeline complete for {selected_episode}!")
                 st.info("💡 **Next steps:**\n1. Curate facebank on CAST page\n2. Click **Cluster** button")
                 safe_rerun()
             else:
-                st.error(f"❌ Prepare failed: {result.get('error', 'Unknown error')}")
+                st.error(f"❌ Full pipeline failed: {result.get('error', 'Unknown error')}")
                 with st.expander("Error details"):
                     st.json(result)
 
         except Exception as e:
-            st.error(f"❌ Prepare failed: {str(e)}")
+            st.error(f"❌ Full pipeline failed: {str(e)}")
             import traceback
             with st.expander("Error details"):
                 st.code(traceback.format_exc())
@@ -724,7 +811,8 @@ def main():
     # Handle Cluster button click
     if st.session_state.pop("_trigger_cluster", False):
         st.info("🎯 **Starting Cluster pipeline...**")
-        st.write("Clustering prepared tracks against current facebank")
+        st.write("Grouping face tracks by identity using current facebank")
+        st.caption("(Missing stages will auto-run: Detect → Track → Cluster)")
 
         # Mark pipeline as starting
         diagnostics_dir = DATA_ROOT / "harvest" / selected_episode / "diagnostics"
@@ -744,7 +832,7 @@ def main():
         try:
             from jobs.tasks.orchestrate import orchestrate_cluster_only
 
-            with st.spinner("Clustering... This may take a few minutes."):
+            with st.spinner("Running cluster pipeline (auto-running missing stages if needed)..."):
                 result = orchestrate_cluster_only(
                     episode_id=selected_episode,
                     data_root=DATA_ROOT,
@@ -756,7 +844,8 @@ def main():
                 st.info("💡 **Next step:** Click **Analyze** to generate timeline & totals")
                 safe_rerun()
             else:
-                st.error(f"❌ Cluster failed: {result.get('error', 'Unknown error')}")
+                error = result.get("error", "Unknown error")
+                st.error(f"❌ Cluster failed: {error}")
                 with st.expander("Error details"):
                     st.json(result)
 

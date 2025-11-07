@@ -25,8 +25,8 @@ from screentime.recognition.embed_arcface import ArcFaceEmbedder
 
 logger = logging.getLogger(__name__)
 
-# Checkpoint interval (30 seconds)
-CHECKPOINT_INTERVAL_SEC = 30
+# Checkpoint interval (10 seconds) - faster heartbeat for better stall detection
+CHECKPOINT_INTERVAL_SEC = 10
 
 
 def detect_embed_task(job_id: str | None = None, episode_id: str | None = None, episode_key: str | None = None) -> dict:
@@ -90,6 +90,16 @@ def detect_embed_task(job_id: str | None = None, episode_id: str | None = None, 
     logger.info(f"[DETECT] job_id={job_id}")
     logger.info(f"[DETECT] stage=start")
 
+    # CRITICAL: Check for existing active job to prevent duplicates
+    from episodes.runtime import get_active_job, check_job_stalled
+    existing_job = get_active_job(episode_key, "detect", DATA_ROOT)
+    if existing_job and existing_job != job_id:
+        # Check if it's truly active or stalled
+        if not check_job_stalled(existing_job, DATA_ROOT):
+            raise ValueError(f"ERR_JOB_ALREADY_RUNNING: Detect job already running: {existing_job}. Use Resume or Cancel in UI.")
+        else:
+            logger.warning(f"[DETECT] {episode_key} Stalled job {existing_job} found, proceeding with new job {job_id}")
+
     # CRITICAL: Create job envelope with absolute paths
     # Ensure job envelope exists at absolute path
     job_dir = DATA_ROOT / "jobs" / job_id
@@ -118,6 +128,17 @@ def detect_embed_task(job_id: str | None = None, episode_id: str | None = None, 
             envelope = json.load(f)
         logger.info(f"[DETECT] {episode_key} Loaded existing envelope from {meta_path}")
 
+    # CRITICAL: Create lock file to prevent duplicate jobs
+    lock_path = job_dir / ".lock"
+    lock_data = {
+        "job_id": job_id,
+        "pid": os.getpid(),
+        "started_at": datetime.utcnow().isoformat(),
+    }
+    with open(lock_path, "w") as f:
+        json.dump(lock_data, f, indent=2)
+    logger.info(f"[DETECT] {episode_key} Created lock file at {lock_path}")
+
     # Mark stage as running in envelope (for UI polling)
     try:
         job_manager.update_stage_status(job_id, "detect", "running")
@@ -136,6 +157,11 @@ def detect_embed_task(job_id: str | None = None, episode_id: str | None = None, 
         logger.info(f"[DETECT] {episode_key} registry detected=false")
     except Exception as e:
         logger.warning(f"[DETECT] {episode_key} Could not update registry: {e}")
+
+    # CRITICAL: Register active job in runtime for resume after refresh
+    from episodes.runtime import set_active_job
+    set_active_job(episode_key, "detect", job_id, DATA_ROOT)
+    logger.info(f"[DETECT] {episode_key} Registered as active job: {job_id}")
 
     # Load config - use absolute path
     config_path = BASE_DIR / "configs" / "pipeline.yaml"
@@ -659,6 +685,17 @@ def detect_embed_task(job_id: str | None = None, episode_id: str | None = None, 
             logger.error(f"[DETECT] {episode_key} ERR_REGISTRY_UPDATE_FAILED: {e}")
             raise ValueError(f"ERR_REGISTRY_UPDATE_FAILED: Could not update registry for {episode_key}: {e}")
 
+        # CRITICAL: Clear active job from runtime on success
+        from episodes.runtime import clear_active_job
+        clear_active_job(episode_key, "detect", DATA_ROOT)
+        logger.info(f"[DETECT] {episode_key} Cleared active job from runtime")
+
+        # Remove lock file on success
+        lock_path = job_dir / ".lock"
+        if lock_path.exists():
+            lock_path.unlink()
+            logger.info(f"[DETECT] {episode_key} Removed lock file")
+
         # CRITICAL: Add "done": true marker to meta.json for trivial polling
         try:
             with open(meta_path, "r") as f:
@@ -718,6 +755,23 @@ def detect_embed_task(job_id: str | None = None, episode_id: str | None = None, 
                 logger.info(f"[DETECT] {episode_key} envelope stage=error")
             except Exception as env_err:
                 logger.error(f"[DETECT] {episode_key} Could not update envelope with error: {env_err}")
+
+        # CRITICAL: Clear active job on error
+        from episodes.runtime import clear_active_job
+        try:
+            clear_active_job(episode_key, "detect", DATA_ROOT)
+            logger.info(f"[DETECT] {episode_key} Cleared active job from runtime (error)")
+        except Exception as clear_err:
+            logger.warning(f"[DETECT] {episode_key} Could not clear active job: {clear_err}")
+
+        # Remove lock file on error
+        try:
+            lock_path = job_dir / ".lock"
+            if lock_path.exists():
+                lock_path.unlink()
+                logger.info(f"[DETECT] {episode_key} Removed lock file (error)")
+        except Exception as lock_err:
+            logger.warning(f"[DETECT] {episode_key} Could not remove lock file: {lock_err}")
 
         # CRITICAL: Emit error progress to pipeline_state.json
         try:

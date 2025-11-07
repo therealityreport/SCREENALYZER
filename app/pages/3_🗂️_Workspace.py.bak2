@@ -362,7 +362,7 @@ def main():
 
     with header_cols[1]:
         cluster_disabled = not can_run or not artifact_status["prepared"]
-        cluster_help = "Agglomerative Clustering: Group face tracks by identity using cosine similarity on ArcFace embeddings"
+        cluster_help = "Cluster prepared tracks against current facebank"
         if not can_run:
             cluster_help = f"Blocked: {block_reason}"
         elif not artifact_status["prepared"]:
